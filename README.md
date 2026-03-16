@@ -34,7 +34,115 @@ RTL-SDR dongle
 
 ---
 
-## Prerequisites
+## Option A — Docker (recommended for new users)
+
+This is the easiest way to get started. Everything runs in a single container: welle-cli, ffmpeg, and Icecast are all included — no manual software installation needed.
+
+Pre-built images for **amd64** and **arm64** are published automatically to GitHub Container Registry on every release.
+
+### Prerequisites
+
+- Docker and Docker Compose installed
+- RTL-SDR dongle connected to the host
+- DVB kernel drivers blacklisted (recommended — see below)
+
+### Blacklisting the DVB kernel drivers
+
+Linux automatically loads DVB drivers when you plug in an RTL-SDR dongle. Blacklist them to prevent conflicts:
+
+```bash
+echo -e "blacklist dvb_usb_rtl28xxu\nblacklist rtl2832\nblacklist rtl2830" \
+    | sudo tee /etc/modprobe.d/blacklist-rtlsdr.conf
+sudo modprobe -r dvb_usb_rtl28xxu rtl2832 rtl2830
+```
+
+> **Docker users:** The container runs in privileged mode which lets librtlsdr claim the dongle automatically in most cases, but blacklisting avoids edge cases after re-plugging.
+
+### Quickstart — pre-built image (easiest)
+
+Create a `docker-compose.yml`, adjust the values, and run `docker compose up`.
+
+#### With built-in Icecast
+
+The container runs its own Icecast server. Each DAB service gets its own mount point (e.g. `/dab/dr-p1`, `/dab/dr-p3`).
+
+```yaml
+services:
+  dab-radio:
+    image: ghcr.io/macsatcom/lyrion-dab-radio:latest
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "9980:9980"   # DAB Daemon HTTP API
+      - "8000:8000"   # Icecast streams
+    environment:
+      ICECAST_MODE:       internal
+      ICECAST_SOURCE:     changeme
+      ICECAST_ADMIN_PASS: changeme_admin
+      ICECAST_PORT:       8000
+      DAEMON_PORT:        9980
+    restart: unless-stopped
+```
+
+#### With an existing Icecast server
+
+The container streams to an Icecast server already running on your network.
+
+```yaml
+services:
+  dab-radio:
+    image: ghcr.io/macsatcom/lyrion-dab-radio:latest
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "9980:9980"   # DAB Daemon HTTP API
+    environment:
+      ICECAST_MODE:       external
+      ICECAST_HOST:       192.168.1.50
+      ICECAST_SOURCE:     your-source-password
+      ICECAST_PORT:       8000
+      DAEMON_PORT:        9980
+    restart: unless-stopped
+```
+
+```bash
+docker compose up
+```
+
+Once running:
+- DAB Daemon API: `http://<host-ip>:9980`
+- Icecast streams: `http://<host-ip>:8000/dab/<service-slug>`
+
+### Quickstart — build from source
+
+```bash
+git clone https://github.com/macsatcom/Lyrion_DAB_Radio.git
+cd Lyrion_DAB_Radio/docker
+cp .env.example .env
+# edit .env with your values
+docker compose up --build
+```
+
+The first build takes several minutes (welle-cli is compiled from source).
+
+### Configuring the MUX list
+
+By default the container listens to **DR MUX (channel 11C)**. To change this, set the `MUX_LIST` environment variable as a JSON string:
+
+```yaml
+environment:
+  MUX_LIST: '[{"key":"mux1","name":"My MUX (10B)","channel":"10B"}]'
+```
+
+Multiple MUXes are supported — the daemon can switch between them via the API.
+
+---
+
+## Option B — Manual installation
+
+### Prerequisites
 
 - Linux server (Debian/Ubuntu recommended)
 - RTL-SDR USB dongle connected and working
