@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
         pkg-config \
+        xxd \
         gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,10 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --depth 1 https://github.com/AlbrechtL/welle.io.git /tmp/welle.io \
     && cmake -S /tmp/welle.io -B /tmp/welle.io/build \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_WELLE_IO=OFF \
         -DBUILD_WELLE_CLI=ON \
-        -DBUILD_GUI_APP=OFF \
-    && cmake --build /tmp/welle.io/build -j$(nproc) \
-    && install -m 755 /tmp/welle.io/build/src/welle-cli/welle-cli /usr/local/bin/welle-cli \
+        -DRTLSDR=ON \
+    && cmake --build /tmp/welle.io/build --target welle-cli -j$(nproc) \
+    && install -m 755 /tmp/welle.io/build/welle-cli /usr/local/bin/welle-cli \
     && rm -rf /tmp/welle.io
 
 # ── Application files ─────────────────────────────────────────────────────────
