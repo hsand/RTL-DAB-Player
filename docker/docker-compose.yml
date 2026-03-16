@@ -1,0 +1,33 @@
+services:
+  dab-radio:
+    # To use the pre-built image from GitHub Container Registry instead of
+    # building locally, replace the 'build' block with:
+    #   image: ghcr.io/macsatcom/lyrion-dab-radio:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # privileged gives the container permission to call libusb_detach_kernel_driver(),
+    # which lets librtlsdr claim the dongle even if the host's rtl-dvb kernel drivers
+    # are loaded. See README for notes on blacklisting those drivers.
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb   # passes all USB devices into the container
+    ports:
+      - "${DAEMON_PORT:-9980}:${DAEMON_PORT:-9980}"   # DAB Daemon HTTP API
+      - "${ICECAST_PORT:-8000}:${ICECAST_PORT:-8000}" # Icecast stream — only needed when ICECAST_MODE=internal
+    environment:
+      # ── Icecast mode ────────────────────────────────────────────────────────
+      # 'internal'  — start Icecast inside this container (default)
+      # 'external'  — use an existing Icecast server; set ICECAST_HOST in .env
+      ICECAST_MODE:       ${ICECAST_MODE:-internal}
+      ICECAST_HOST:       ${ICECAST_HOST:-}
+      # ── Icecast credentials / mount ─────────────────────────────────────────
+      ICECAST_SOURCE:     ${ICECAST_SOURCE:-changeme}
+      ICECAST_ADMIN_PASS: ${ICECAST_ADMIN_PASS:-changeme_admin}
+      ICECAST_PORT:       ${ICECAST_PORT:-8000}
+      ICECAST_MOUNT:      ${ICECAST_MOUNT:-/dab}
+      # ── Daemon ──────────────────────────────────────────────────────────────
+      DAEMON_PORT:        ${DAEMON_PORT:-9980}
+      # ── MUX list (optional JSON override) ───────────────────────────────────
+      MUX_LIST:           ${MUX_LIST:-}
+    restart: unless-stopped

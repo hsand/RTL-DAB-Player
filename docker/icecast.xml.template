@@ -1,0 +1,40 @@
+<icecast>
+    <location>FM Radio</location>
+    <admin>admin@localhost</admin>
+
+    <limits>
+        <clients>100</clients>
+        <sources>5</sources>
+        <queue-size>524288</queue-size>
+        <burst-on-connect>1</burst-on-connect>
+        <burst-size>65536</burst-size>
+    </limits>
+
+    <authentication>
+        <source-password>${ICECAST_SOURCE}</source-password>
+        <relay-password>${ICECAST_SOURCE}</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>${ICECAST_ADMIN_PASS}</admin-password>
+    </authentication>
+
+    <hostname>localhost</hostname>
+
+    <listen-socket>
+        <port>8000</port>
+        <bind-address>0.0.0.0</bind-address>
+    </listen-socket>
+
+    <http-headers>
+        <header name="Access-Control-Allow-Origin" value="*" />
+    </http-headers>
+
+    <logging>
+        <accesslog>-</accesslog>
+        <errorlog>-</errorlog>
+        <loglevel>3</loglevel>
+    </logging>
+
+    <security>
+        <chroot>0</chroot>
+    </security>
+</icecast>

@@ -24,33 +24,36 @@ import urllib.request
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-WELLE_CLI_BIN      = "/usr/local/bin/welle-cli"
-WELLE_PORT         = 9090          # internal welle-cli HTTP port
-
-SERVICES_CACHE     = "/var/lib/dab-daemon/services.json"
-
-ICECAST_HOST       = "your-icecast-host"
-ICECAST_PORT       = 8000
-ICECAST_SOURCE     = "your-source-password"
-ICECAST_ADMIN_USER = "admin"
-ICECAST_ADMIN_PASS = "your-admin-password"
-
-DAEMON_PORT        = 9980
+WELLE_CLI_BIN      = os.environ.get("WELLE_CLI_BIN",    "/usr/local/bin/welle-cli")
+WELLE_PORT         = int(os.environ.get("WELLE_PORT",   "9090"))
+SERVICES_CACHE     = os.environ.get("SERVICES_CACHE",   "/var/lib/dab-daemon/services.json")
+ICECAST_HOST       = os.environ.get("ICECAST_HOST",     "your-icecast-host")
+ICECAST_PORT       = int(os.environ.get("ICECAST_PORT", "8000"))
+ICECAST_SOURCE     = os.environ.get("ICECAST_SOURCE",   "your-source-password")
+ICECAST_ADMIN_USER = os.environ.get("ICECAST_ADMIN_USER", "admin")
+ICECAST_ADMIN_PASS = os.environ.get("ICECAST_ADMIN_PASS", "your-admin-password")
+DAEMON_PORT        = int(os.environ.get("DAEMON_PORT",  "9980"))
 
 # How long to wait for welle-cli to discover services
-DISCOVERY_TIMEOUT  = 30
+DISCOVERY_TIMEOUT  = int(os.environ.get("DISCOVERY_TIMEOUT", "30"))
 
 # ─── MUX configuration ────────────────────────────────────────────────────────
 
-MUX_LIST = [
-    {
-        "key":     "mux1",
-        "name":    "DR MUX (11C)",
-        "channel": "11C",
-    },
-    # Add more MUXes here:
-    # { "key": "mux2", "name": "MUX 2", "channel": "10B" },
-]
+# MUX_LIST can be overridden via a JSON env var, e.g.:
+# MUX_LIST=[{"key":"mux1","name":"DR MUX (11C)","channel":"11C"}]
+_mux_list_env = os.environ.get("MUX_LIST")
+if _mux_list_env:
+    MUX_LIST = json.loads(_mux_list_env)
+else:
+    MUX_LIST = [
+        {
+            "key":     "mux1",
+            "name":    "DR MUX (11C)",
+            "channel": "11C",
+        },
+        # Add more MUXes here:
+        # { "key": "mux2", "name": "MUX 2", "channel": "10B" },
+    ]
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
