@@ -78,6 +78,8 @@ sub handleFeed {
                 }
             }
 
+            @items = sort { lc($a->{name}) cmp lc($b->{name}) } @items;
+
             $cb->({ items => \@items });
         },
         sub {

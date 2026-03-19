@@ -34,6 +34,18 @@ RTL-SDR dongle
 
 ---
 
+## Web UI
+
+The daemon includes a built-in web interface accessible at `http://<host>:9980` — no extra software needed.
+
+Features:
+- Multiplex selector — switch between configured MUXes with a single click
+- Alphabetically sorted service list for the active MUX
+- Built-in audio player — click a service to start listening immediately
+- Live status indicator (receiving / switching / stopped)
+
+---
+
 ## Option A — Docker (recommended for new users)
 
 This is the easiest way to get started. Everything runs in a single container: welle-cli, ffmpeg, and Icecast are all included — no manual software installation needed.

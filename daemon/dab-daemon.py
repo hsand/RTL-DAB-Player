@@ -33,6 +33,8 @@ ICECAST_SOURCE     = os.environ.get("ICECAST_SOURCE",   "your-source-password")
 ICECAST_ADMIN_USER = os.environ.get("ICECAST_ADMIN_USER", "admin")
 ICECAST_ADMIN_PASS = os.environ.get("ICECAST_ADMIN_PASS", "your-admin-password")
 DAEMON_PORT        = int(os.environ.get("DAEMON_PORT",  "9980"))
+ICECAST_MODE       = os.environ.get("ICECAST_MODE",    "internal")
+ICECAST_MOUNT_BASE = os.environ.get("ICECAST_MOUNT",   "/dab")
 
 # How long to wait for welle-cli to discover services
 DISCOVERY_TIMEOUT  = int(os.environ.get("DISCOVERY_TIMEOUT", "30"))
@@ -54,6 +56,169 @@ else:
         # Add more MUXes here:
         # { "key": "mux2", "name": "MUX 2", "channel": "10B" },
     ]
+
+# ─── Web UI ───────────────────────────────────────────────────────────────────
+
+WEB_UI_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAB Radio</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #111827; color: #e5e7eb;
+    font-family: ui-monospace, monospace;
+    min-height: 100vh; padding: 2rem;
+    display: flex; flex-direction: column; align-items: center; gap: 1.5rem;
+  }
+  h1 { font-size: 1.1rem; letter-spacing: 0.25em; color: #6b7280; text-transform: uppercase; }
+  #now-playing { font-size: 1.6rem; font-weight: bold; color: #34d399; min-height: 2rem; }
+  #dls { font-size: 0.9rem; color: #9ca3af; min-height: 1.2rem; }
+  audio { width: 100%; max-width: 480px; accent-color: #34d399; }
+  .section-label {
+    font-size: 0.75rem; letter-spacing: 0.15em; text-transform: uppercase;
+    color: #4b5563; width: 100%; max-width: 480px;
+  }
+  .mux-row { display: flex; gap: 0.5rem; flex-wrap: wrap; width: 100%; max-width: 480px; }
+  .mux-btn {
+    background: #1f2937; color: #9ca3af; border: 1px solid #374151;
+    padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer;
+    border-radius: 5px; font-family: inherit;
+  }
+  .mux-btn.active { background: #34d399; color: #111827; border-color: #34d399; font-weight: bold; }
+  .mux-btn:hover:not(.active) { border-color: #6b7280; color: #e5e7eb; }
+  .service-list { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 0.4rem; }
+  .svc-btn {
+    background: #1f2937; color: #e5e7eb; border: 1px solid #374151;
+    padding: 0.55rem 1rem; font-size: 0.95rem; cursor: pointer;
+    border-radius: 5px; text-align: left; font-family: inherit;
+  }
+  .svc-btn.active { border-color: #34d399; color: #34d399; }
+  .svc-btn:hover:not(.active) { border-color: #6b7280; }
+  #status-line { font-size: 0.8rem; color: #4b5563; }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: #374151; display: inline-block; margin-right: 0.4rem; }
+  #status-dot.alive { background: #34d399; }
+  .switching { color: #fbbf24 !important; }
+</style>
+</head>
+<body>
+<h1>DAB Radio</h1>
+<div id="now-playing">--</div>
+<div id="dls"></div>
+<audio id="player" controls></audio>
+
+<div class="section-label">Multiplex</div>
+<div class="mux-row" id="mux-row"></div>
+
+<div class="section-label">Services</div>
+<div class="service-list" id="service-list"></div>
+
+<div id="status-line"><span id="status-dot"></span><span id="status-text">loading...</span></div>
+
+<script>
+let cfg = {};
+let muxData = [];
+let currentMux = null;
+let currentStream = null;
+let switching = false;
+
+async function init() {
+  cfg = await fetch('/config').then(r => r.json());
+  await refresh();
+  setInterval(refresh, 3000);
+}
+
+function streamUrl(svc) {
+  const path = svc.stream.replace(/^https?:\/\/[^/]+/, '');
+  const host = cfg.icecast_mode === 'internal' ? window.location.hostname : cfg.icecast_host;
+  return 'http://' + host + ':' + cfg.icecast_port + path;
+}
+
+async function refresh() {
+  try {
+    const [muxes, status] = await Promise.all([
+      fetch('/muxes').then(r => r.json()),
+      fetch('/status').then(r => r.json()),
+    ]);
+
+    const alive = status.welle_alive;
+    document.getElementById('status-dot').className = alive ? 'alive' : '';
+
+    if (switching) {
+      document.getElementById('status-text').textContent = 'switching mux...';
+      document.getElementById('status-text').className = 'switching';
+    } else {
+      document.getElementById('status-text').textContent = alive ? 'receiving' : 'stopped';
+      document.getElementById('status-text').className = '';
+    }
+
+    if (status.current_mux !== currentMux || muxData.length === 0) {
+      currentMux = status.current_mux;
+      switching = false;
+      muxData = muxes;
+      renderMuxButtons(muxes, currentMux);
+      const activeMux = muxes.find(m => m.key === currentMux);
+      if (activeMux) renderServices(activeMux.services);
+    }
+  } catch(e) {}
+}
+
+function renderMuxButtons(muxes, activeMux) {
+  const row = document.getElementById('mux-row');
+  row.innerHTML = '';
+  for (const m of muxes) {
+    const btn = document.createElement('button');
+    btn.className = 'mux-btn' + (m.key === activeMux ? ' active' : '');
+    btn.textContent = m.name;
+    btn.onclick = () => switchMux(m.key);
+    row.appendChild(btn);
+  }
+}
+
+function renderServices(services) {
+  const list = document.getElementById('service-list');
+  list.innerHTML = '';
+  const sorted = [...services].sort((a, b) => a.name.localeCompare(b.name));
+  for (const svc of sorted) {
+    const btn = document.createElement('button');
+    const url = streamUrl(svc);
+    btn.className = 'svc-btn' + (url === currentStream ? ' active' : '');
+    btn.textContent = svc.name;
+    btn.onclick = () => playSvc(svc, btn);
+    list.appendChild(btn);
+  }
+}
+
+function playSvc(svc, btn) {
+  const url = streamUrl(svc);
+  currentStream = url;
+  document.getElementById('player').src = url;
+  document.getElementById('now-playing').textContent = svc.name;
+  document.querySelectorAll('.svc-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+async function switchMux(key) {
+  if (key === currentMux || switching) return;
+  switching = true;
+  currentStream = null;
+  document.getElementById('player').src = '';
+  document.getElementById('now-playing').textContent = '--';
+  document.getElementById('service-list').innerHTML = '';
+  document.getElementById('status-text').textContent = 'switching mux...';
+  document.getElementById('status-text').className = 'switching';
+  renderMuxButtons(muxData, key);
+  await fetch('/switch/' + key);
+}
+
+init();
+</script>
+</body>
+</html>
+"""
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -379,7 +544,22 @@ class DABHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        if parsed.path == "/status":
+        if parsed.path in ("/", "/index.html"):
+            body = WEB_UI_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/config":
+            json_response(self, 200, {
+                "icecast_mode":  ICECAST_MODE,
+                "icecast_host":  ICECAST_HOST,
+                "icecast_port":  ICECAST_PORT,
+            })
+
+        elif parsed.path == "/status":
             with state_lock:
                 active = [
                     {
