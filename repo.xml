@@ -9,7 +9,7 @@
             <desc lang="EN">DAB+ radio reception via RTL-SDR and welle-cli</desc>
             <url>https://github.com/macsatcom/Lyrion_DAB_Radio/releases/download/plugin-v1.02/DABRadio-1.02.zip</url>
             <link>https://github.com/macsatcom/Lyrion_DAB_Radio</link>
-            <sha>7b00fc8313919da800ff3f490ed4a7b66de5d661</sha>
+            <sha>00eb222d11dbce08ddfb0c787f4ebbad6125aeb8</sha>
             <creator>Kasper S Nielsen</creator>
             <creatorEmail>kasper@smsweb.dk</creatorEmail>
         </plugin>
