@@ -407,6 +407,24 @@ def metadata_updater():
                 dls_state[mount] = dls
                 update_icecast_metadata(mount, dls)
 
+# ─── welle-cli watchdog ───────────────────────────────────────────────────────
+
+def welle_watchdog():
+    """
+    Checks every 15 s if welle-cli is still alive.
+    If it has crashed while a MUX is active, restarts the full mux
+    (which re-launches welle-cli and all ffmpeg streams).
+    """
+    while True:
+        time.sleep(15)
+        with state_lock:
+            mux_key = current_mux_key
+            alive = welle_proc is not None and welle_proc.poll() is None
+
+        if mux_key and not alive:
+            print(f"[welle-watchdog] welle-cli has crashed — restarting mux '{mux_key}'")
+            switch_mux(mux_key)
+
 # ─── Stream watchdog ─────────────────────────────────────────────────────────
 
 def stream_watchdog():
@@ -660,6 +678,7 @@ if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", DAEMON_PORT), DABHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=metadata_updater, daemon=True).start()
+    threading.Thread(target=welle_watchdog,  daemon=True).start()
     threading.Thread(target=stream_watchdog, daemon=True).start()
     print(f"[daemon] HTTP API on port {DAEMON_PORT}")
     print(f"[daemon] Endpoints: /status  /muxes  /switch/<key>  /rescan  POST /stop")
