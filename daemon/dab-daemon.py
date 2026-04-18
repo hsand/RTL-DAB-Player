@@ -264,9 +264,14 @@ def stop_welle():
         try:
             welle_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            print("[daemon] welle-cli did not respond to SIGTERM — sending SIGKILL")
             welle_proc.kill()
+            welle_proc.wait(timeout=5)
         welle_proc = None
         print("[daemon] welle-cli stopped")
+    elif welle_proc:
+        # Process already exited — just clear the reference
+        welle_proc = None
 
 def start_welle(channel):
     global welle_proc
@@ -409,21 +414,66 @@ def metadata_updater():
 
 # ─── welle-cli watchdog ───────────────────────────────────────────────────────
 
+_welle_restart_in_progress = threading.Event()
+
+def _welle_health_check():
+    """
+    Returns True if welle-cli process is alive AND its HTTP endpoint responds.
+    A hanging/zombie welle-cli that no longer serves data is considered dead.
+    """
+    with state_lock:
+        proc = welle_proc
+    if proc is None or proc.poll() is not None:
+        return False
+    # Process is alive — verify it actually responds
+    try:
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=5
+        )
+        resp.read()
+        return True
+    except Exception:
+        return False
+
 def welle_watchdog():
     """
-    Checks every 15 s if welle-cli is still alive.
-    If it has crashed while a MUX is active, restarts the full mux
-    (which re-launches welle-cli and all ffmpeg streams).
+    Checks every 15 s if welle-cli is alive and responsive.
+    If the HTTP health-check fails for 3 consecutive attempts (45 s),
+    restarts the full mux (welle-cli + all ffmpeg streams).
     """
+    consecutive_failures = 0
+    FAILURE_THRESHOLD = 3
+
     while True:
         time.sleep(15)
         with state_lock:
             mux_key = current_mux_key
-            alive = welle_proc is not None and welle_proc.poll() is None
 
-        if mux_key and not alive:
-            print(f"[welle-watchdog] welle-cli has crashed — restarting mux '{mux_key}'")
-            switch_mux(mux_key)
+        if not mux_key:
+            consecutive_failures = 0
+            continue
+
+        if _welle_restart_in_progress.is_set():
+            # A restart is already underway — don't pile on
+            consecutive_failures = 0
+            continue
+
+        if _welle_health_check():
+            consecutive_failures = 0
+            continue
+
+        consecutive_failures += 1
+        print(f"[welle-watchdog] health-check failed ({consecutive_failures}/{FAILURE_THRESHOLD})")
+
+        if consecutive_failures >= FAILURE_THRESHOLD:
+            consecutive_failures = 0
+            print(f"[welle-watchdog] welle-cli unresponsive — restarting mux '{mux_key}'")
+            _welle_restart_in_progress.set()
+            try:
+                switch_mux(mux_key)
+            finally:
+                # Clear after a delay so the new welle-cli has time to start
+                threading.Timer(DISCOVERY_TIMEOUT + 10, _welle_restart_in_progress.clear).start()
 
 # ─── Stream watchdog ─────────────────────────────────────────────────────────
 
