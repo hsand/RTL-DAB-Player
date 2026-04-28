@@ -18,11 +18,19 @@ import time
 import json
 import base64
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.parse
 import urllib.request
+
+
+def linear_to_db(value):
+    """Convert linear audio level (0.0-1.0) from welle-cli to dBFS."""
+    if value <= 0:
+        return -100.0  # essentially silence
+    return 20 * math.log10(value)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -442,20 +450,22 @@ def signal_quality_monitor():
             mount = f"/dab/{slugify(name)}"
 
             audio = svc.get("audiolevel", {})
-            left = audio.get("left", 0)
-            right = audio.get("right", 0)
+            left_linear = audio.get("left", 0)
+            right_linear = audio.get("right", 0)
+            left_db = linear_to_db(left_linear)
+            right_db = linear_to_db(right_linear)
 
             errs = svc.get("errorcounters", {})
             fe = errs.get("frameerrors", 0)
             rs = errs.get("rserrors", 0)
             aac = errs.get("aacerrors", 0)
 
-            log_msg = f"{name} (SID={sid}) audio_left={left:.1f} dBFS audio_right={right:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
+            log_msg = f"{name} (SID={sid}) audio_left={left_db:.1f} dBFS audio_right={right_db:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
             logger_signal.info(log_msg)
 
             # Check for warnings
-            if left < -60 or right < -60:
-                logger_signal.warning(f"{name} audio level very low (silence?): left={left:.1f}, right={right:.1f}")
+            if left_db < -60 or right_db < -60:
+                logger_signal.warning(f"{name} audio level very low (silence?): left={left_db:.1f}, right={right_db:.1f}")
 
             prev = prev_error_counters.get(mount, {})
             if prev:
@@ -464,6 +474,10 @@ def signal_quality_monitor():
                 da = aac - prev.get("aacerrors", 0)
                 if df > 5 or dr > 5 or da > 5:
                     logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
+
+            # High RS errors directly cause audio glitches/dropouts
+            if rs > 100:
+                logger_signal.warning(f"{name} HIGH RS errors ({rs}) — expect audio dropouts/glitches")
 
             prev_error_counters[mount] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
 
