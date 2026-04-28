@@ -30,4 +30,6 @@ services:
       DAEMON_PORT:        ${DAEMON_PORT:-9980}
       # ── MUX list (optional JSON override) ───────────────────────────────────
       MUX_LIST:           ${MUX_LIST:-}
+    volumes:
+      - ./logs:/var/log/dabservice  # Map container logs to host directory
     restart: unless-stopped

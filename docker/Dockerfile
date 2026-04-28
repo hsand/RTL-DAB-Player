@@ -48,7 +48,8 @@ COPY docker/icecast.xml.template  /etc/icecast.xml.template
 COPY docker/entrypoint.sh         /entrypoint.sh
 
 RUN chmod +x /usr/local/bin/dab-daemon.py /entrypoint.sh \
-    && mkdir -p /var/lib/dab-daemon
+    && mkdir -p /var/lib/dab-daemon /var/log/dabservice \
+    && chmod 777 /var/log/dabservice
 
 # 9980 = DAB Daemon HTTP API, 8000 = Icecast stream
 EXPOSE 9980 8000

@@ -17,6 +17,8 @@ import threading
 import time
 import json
 import base64
+import logging
+from logging.handlers import RotatingFileHandler
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.parse
@@ -38,6 +40,68 @@ ICECAST_MOUNT_BASE = os.environ.get("ICECAST_MOUNT",   "/dab")
 
 # How long to wait for welle-cli to discover services
 DISCOVERY_TIMEOUT  = int(os.environ.get("DISCOVERY_TIMEOUT", "30"))
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+LOG_DIR           = os.environ.get("LOG_DIR", "/var/log/dabservice")
+LOG_MAX_BYTES     = int(os.environ.get("LOG_MAX_BYTES", "10485760"))
+LOG_BACKUP_COUNT  = int(os.environ.get("LOG_BACKUP_COUNT", "3"))
+
+# ─── Signal Quality ──────────────────────────────────────────────────────────
+
+SNR_WARNING_THRESHOLD = float(os.environ.get("SNR_WARNING_THRESHOLD", "10"))
+
+# ─── Preventive Restart ───────────────────────────────────────────────────────
+
+PREVENTIVE_RESTART_HOUR = int(os.environ.get("PREVENTIVE_RESTART_HOUR", "3"))
+
+# ─── Logging Setup ────────────────────────────────────────────────────────────
+
+def setup_logging():
+    """Configure rotating file loggers."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    # Daemon logger
+    handler_daemon = RotatingFileHandler(
+        os.path.join(LOG_DIR, 'dab-daemon.log'),
+        maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
+    handler_daemon.setFormatter(fmt)
+
+    logger_daemon = logging.getLogger('dab_daemon')
+    logger_daemon.addHandler(handler_daemon)
+    logger_daemon.setLevel(logging.INFO)
+    logger_daemon.propagate = False
+
+    # Signal quality logger
+    handler_signal = RotatingFileHandler(
+        os.path.join(LOG_DIR, 'signal-quality.log'),
+        maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
+    handler_signal.setFormatter(fmt)
+
+    logger_signal = logging.getLogger('signal_quality')
+    logger_signal.addHandler(handler_signal)
+    logger_signal.setLevel(logging.INFO)
+    logger_signal.propagate = False
+
+    # ffmpeg errors logger
+    handler_ffmpeg = RotatingFileHandler(
+        os.path.join(LOG_DIR, 'ffmpeg-errors.log'),
+        maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
+    handler_ffmpeg.setFormatter(fmt)
+
+    logger_ffmpeg = logging.getLogger('ffmpeg_errors')
+    logger_ffmpeg.addHandler(handler_ffmpeg)
+    logger_ffmpeg.setLevel(logging.WARNING)
+    logger_ffmpeg.propagate = False
+
+    return logger_daemon, logger_signal, logger_ffmpeg
+
+logger_daemon, logger_signal, logger_ffmpeg = setup_logging()
 
 # ─── MUX configuration ────────────────────────────────────────────────────────
 
@@ -224,9 +288,18 @@ init();
 
 current_mux_key = None
 welle_proc      = None
-stream_procs    = {}   # mount → {"ffmpeg": proc, "service": svc_dict}
+welle_stderr_thread = None
+stream_procs    = {}   # mount → {"ffmpeg": proc, "service": svc_dict, "stderr_thread": thread, "reconnect_count": int}
 dls_state       = {}   # mount → last known DLS string
 state_lock      = threading.Lock()
+
+# Consolidated mux.json cache
+latest_mux_json = None
+mux_json_lock   = threading.Lock()
+mux_json_event  = threading.Event()
+
+# Signal quality tracking
+prev_error_counters = {}  # mount → {frameerrors, rserrors, aacerrors}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -237,6 +310,17 @@ def slugify(name):
     s = re.sub(r'[åÅ]', 'aa', s)
     s = re.sub(r'[^a-z0-9]+', '-', s)
     return s.strip('-') or 'service'
+
+def fetch_json_with_close(url, timeout=3):
+    """Fetch JSON from welle-cli and always close the response."""
+    try:
+        resp = urllib.request.urlopen(url, timeout=timeout)
+        data = json.loads(resp.read())
+        resp.close()
+        return data
+    except Exception as e:
+        logger_daemon.debug(f"fetch_json_with_close failed for {url}: {e}")
+        return None
 
 # ─── Service cache ────────────────────────────────────────────────────────────
 
@@ -253,35 +337,137 @@ def save_service_cache(cache):
         with open(SERVICES_CACHE, 'w') as f:
             json.dump(cache, f, indent=2)
     except Exception as e:
-        print(f"[daemon] Could not save service cache: {e}")
+        logger_daemon.warning(f"Could not save service cache: {e}")
 
 # ─── welle-cli management ─────────────────────────────────────────────────────
 
+def read_stderr_thread(proc, name):
+    """Read stderr from a process and log any output."""
+    try:
+        for line in proc.stderr:
+            line = line.decode('utf-8', errors='replace').strip()
+            if line:
+                logger_daemon.info(f"[{name}] {line}")
+    except Exception:
+        pass
+
 def stop_welle():
-    global welle_proc
+    global welle_proc, welle_stderr_thread
     if welle_proc and welle_proc.poll() is None:
         welle_proc.terminate()
         try:
             welle_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            print("[daemon] welle-cli did not respond to SIGTERM — sending SIGKILL")
+            logger_daemon.warning("welle-cli did not respond to SIGTERM — sending SIGKILL")
             welle_proc.kill()
             welle_proc.wait(timeout=5)
         welle_proc = None
-        print("[daemon] welle-cli stopped")
+        welle_stderr_thread = None
+        mux_json_event.clear()
+        logger_daemon.info("welle-cli stopped")
     elif welle_proc:
-        # Process already exited — just clear the reference
         welle_proc = None
+        welle_stderr_thread = None
+        logger_daemon.info("welle-cli already exited, cleared reference")
 
 def start_welle(channel):
-    global welle_proc
+    global welle_proc, welle_stderr_thread
     stop_welle()
     welle_proc = subprocess.Popen(
         [WELLE_CLI_BIN, "-c", channel, "-Dw", str(WELLE_PORT)],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
-    print(f"[daemon] welle-cli started on channel {channel} (internal port {WELLE_PORT})")
+    # Start stderr reader thread
+    welle_stderr_thread = threading.Thread(
+        target=read_stderr_thread, args=(welle_proc, "welle-cli"), daemon=True
+    )
+    welle_stderr_thread.start()
+    logger_daemon.info(f"welle-cli started on channel {channel} (internal port {WELLE_PORT})")
+
+# ─── Consolidated mux.json fetcher ────────────────────────────────────────────
+
+def mux_json_fetcher():
+    """Single background thread that fetches mux.json periodically and caches it."""
+    while True:
+        time.sleep(10)
+        if not welle_proc or welle_proc.poll() is not None:
+            continue
+        try:
+            resp = urllib.request.urlopen(
+                f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=5
+            )
+            data = json.loads(resp.read())
+            resp.close()
+            with mux_json_lock:
+                global latest_mux_json
+                latest_mux_json = data
+                mux_json_event.set()
+        except Exception as e:
+            logger_daemon.debug(f"mux_json_fetcher failed: {e}")
+
+# ─── Signal Quality Monitor ────────────────────────────────────────────────────
+
+def signal_quality_monitor():
+    """Polls cached mux.json and logs signal quality metrics."""
+    while True:
+        time.sleep(10)
+        with mux_json_lock:
+            data = latest_mux_json
+
+        if not data:
+            continue
+
+        # Global metrics
+        snr = data.get("snr")
+        freq_corr = data.get("frequencycorrection")
+
+        if snr is not None:
+            msg = f"SNR={snr:.1f} dB"
+            if freq_corr is not None:
+                msg += f", freq_corr={freq_corr} Hz"
+
+            if snr < SNR_WARNING_THRESHOLD:
+                logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
+            else:
+                logger_signal.info(msg)
+
+        # Per-service metrics
+        services = data.get("services", [])
+        for svc in services:
+            if not svc.get("url_mp3"):
+                continue
+            name = svc.get("label", {}).get("label", "unknown")
+            sid = svc.get("sid")
+            mount = f"/dab/{slugify(name)}"
+
+            audio = svc.get("audiolevel", {})
+            left = audio.get("left", 0)
+            right = audio.get("right", 0)
+
+            errs = svc.get("errorcounters", {})
+            fe = errs.get("frameerrors", 0)
+            rs = errs.get("rserrors", 0)
+            aac = errs.get("aacerrors", 0)
+
+            log_msg = f"{name} (SID={sid}) audio_left={left:.1f} dBFS audio_right={right:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
+            logger_signal.info(log_msg)
+
+            # Check for warnings
+            if left < -60 or right < -60:
+                logger_signal.warning(f"{name} audio level very low (silence?): left={left:.1f}, right={right:.1f}")
+
+            prev = prev_error_counters.get(mount, {})
+            if prev:
+                df = fe - prev.get("frameerrors", 0)
+                dr = rs - prev.get("rserrors", 0)
+                da = aac - prev.get("aacerrors", 0)
+                if df > 5 or dr > 5 or da > 5:
+                    logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
+
+            prev_error_counters[mount] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
+
+# ─── Service discovery ───────────────────────────────────────────────────────
 
 def fetch_services_from_welle():
     """
@@ -297,6 +483,7 @@ def fetch_services_from_welle():
         try:
             resp = urllib.request.urlopen(url, timeout=2)
             data = json.loads(resp.read())
+            resp.close()
             # Audio services have a url_mp3 set
             services = [s for s in data.get("services", []) if s.get("url_mp3")]
             count = len(services)
@@ -304,9 +491,9 @@ def fetch_services_from_welle():
                 prev_count = count
                 stable_since = time.time()
                 if count:
-                    print(f"[daemon] Discovered {count} audio services...")
+                    logger_daemon.info(f"Discovered {count} audio services...")
             elif count > 0 and (time.time() - stable_since) >= 5:
-                print(f"[daemon] Service list stable at {count} services")
+                logger_daemon.info(f"Service list stable at {count} services")
                 return services
         except Exception:
             pass
@@ -316,12 +503,30 @@ def fetch_services_from_welle():
     try:
         resp = urllib.request.urlopen(url, timeout=3)
         data = json.loads(resp.read())
+        resp.close()
         return [s for s in data.get("services", []) if s.get("url_mp3")]
     except Exception as e:
-        print(f"[daemon] Failed to fetch mux.json: {e}")
+        logger_daemon.warning(f"Failed to fetch mux.json: {e}")
         return []
 
 # ─── Per-service ffmpeg → Icecast ─────────────────────────────────────────────
+
+FFMPEG_ERROR_KEYWORDS = ['error', 'failed', 'reconnect', 'buffer', 'underflow', 'overflow', 'dropped', 'discontinuity']
+
+def read_ffmpeg_stderr(proc, mount, name):
+    """Read ffmpeg stderr and log relevant lines."""
+    try:
+        for line in proc.stderr:
+            line = line.decode('utf-8', errors='replace').strip()
+            if not line:
+                continue
+            lower = line.lower()
+            for kw in FFMPEG_ERROR_KEYWORDS:
+                if kw in lower:
+                    logger_ffmpeg.warning(f"[{name}] {line}")
+                    break
+    except Exception:
+        pass
 
 def start_stream(raw_svc):
     """Pull MP3 from welle-cli and push to Icecast."""
@@ -350,19 +555,24 @@ def start_stream(raw_svc):
         ice_url,
     ]
 
-    proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
     svc_info = {
         "sid":    sid,
         "name":   name,
         "mount":  mount,
         "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}{mount}",
     }
-    stream_procs[mount] = {"ffmpeg": proc, "service": svc_info}
-    print(f"[daemon] Stream started: {name} ({sid}) → {mount}")
+    stderr_thread = threading.Thread(
+        target=read_ffmpeg_stderr, args=(proc, mount, name), daemon=True
+    )
+    stderr_thread.start()
+    stream_procs[mount] = {"ffmpeg": proc, "service": svc_info, "stderr_thread": stderr_thread, "reconnect_count": 0}
+    logger_daemon.info(f"Stream started: {name} ({sid}) → {mount}")
 
 def stop_stream(mount):
     entry = stream_procs.pop(mount, None)
     dls_state.pop(mount, None)
+    prev_error_counters.pop(mount, None)
     if not entry:
         return
     p = entry.get("ffmpeg")
@@ -372,7 +582,7 @@ def stop_stream(mount):
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
             p.kill()
-    print(f"[daemon] Stream stopped: {mount}")
+    logger_daemon.info(f"Stream stopped: {mount}")
 
 def stop_all_streams():
     for mount in list(stream_procs.keys()):
@@ -389,12 +599,10 @@ def metadata_updater():
         time.sleep(10)
         if not stream_procs or not welle_proc:
             continue
-        try:
-            resp = urllib.request.urlopen(
-                f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=3
-            )
-            data = json.loads(resp.read())
-        except Exception:
+
+        with mux_json_lock:
+            data = latest_mux_json
+        if not data:
             continue
 
         svc_by_sid = {s["sid"]: s for s in data.get("services", [])}
@@ -431,6 +639,7 @@ def _welle_health_check():
             f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=5
         )
         resp.read()
+        resp.close()
         return True
     except Exception:
         return False
@@ -463,11 +672,11 @@ def welle_watchdog():
             continue
 
         consecutive_failures += 1
-        print(f"[welle-watchdog] health-check failed ({consecutive_failures}/{FAILURE_THRESHOLD})")
+        logger_daemon.warning(f"welle-watchdog health-check failed ({consecutive_failures}/{FAILURE_THRESHOLD})")
 
         if consecutive_failures >= FAILURE_THRESHOLD:
             consecutive_failures = 0
-            print(f"[welle-watchdog] welle-cli unresponsive — restarting mux '{mux_key}'")
+            logger_daemon.warning(f"welle-watchdog: welle-cli unresponsive — restarting mux '{mux_key}'")
             _welle_restart_in_progress.set()
             try:
                 switch_mux(mux_key)
@@ -495,7 +704,7 @@ def stream_watchdog():
             ]
 
         for mount, info in dead:
-            print(f"[watchdog] Restarting dead stream: {mount}")
+            logger_daemon.warning(f"Restarting dead stream: {mount}")
             with state_lock:
                 stream_procs.pop(mount, None)
                 dls_state.pop(mount, None)
@@ -512,6 +721,63 @@ def start_stream_from_info(svc_info):
         "mode": "DAB+ via RTL-SDR",
     }
     start_stream(raw_svc)
+
+# ─── Preventive Restart ───────────────────────────────────────────────────────
+
+def preventive_restart_scheduler():
+    """
+    Performs a graceful restart of the current MUX at a configured hour
+    (default 03:00) to clear accumulated welle-cli file descriptor leaks.
+    """
+    while True:
+        now = time.localtime()
+        next_run = time.mktime((
+            now.tm_year, now.tm_mon, now.tm_mday,
+            PREVENTIVE_RESTART_HOUR, 0, 0,
+            now.tm_wday, now.tm_yday, now.tm_isdst
+        ))
+        if next_run <= time.time():
+            # Schedule for tomorrow
+            next_run += 86400
+
+        sleep_secs = next_run - time.time()
+        logger_daemon.info(f"Preventive restart scheduled in {sleep_secs/3600:.1f} hours (at {PREVENTIVE_RESTART_HOUR}:00)")
+        time.sleep(sleep_secs)
+
+        with state_lock:
+            mux_key = current_mux_key
+
+        if not mux_key:
+            logger_daemon.info("No active MUX — skipping preventive restart")
+            continue
+
+        logger_daemon.info(f"Performing preventive restart of MUX '{mux_key}'")
+        switch_mux(mux_key)
+
+# ─── Icecast Stats Poller ────────────────────────────────────────────────────
+
+def icecast_stats_poller():
+    """Polls Icecast admin endpoint every 30 s and logs mount stats."""
+    while True:
+        time.sleep(30)
+        if not stream_procs:
+            continue
+
+        url = f"http://{ICECAST_HOST}:{ICECAST_PORT}/admin/listmounts.xsl"
+        try:
+            req = urllib.request.Request(url)
+            creds = base64.b64encode(f"admin:{ICECAST_ADMIN_PASS}".encode()).decode()
+            req.add_header("Authorization", f"Basic {creds}")
+            resp = urllib.request.urlopen(req, timeout=5)
+            html = resp.read().decode('utf-8', errors='replace')
+            resp.close()
+
+            # Very basic parse — look for mount point info
+            for mount in list(stream_procs.keys()):
+                if mount in html:
+                    logger_daemon.info(f"Icecast mount {mount} is active")
+        except Exception as e:
+            logger_daemon.debug(f"Icecast stats poll failed: {e}")
 
 # ─── Icecast metadata ─────────────────────────────────────────────────────────
 
@@ -530,16 +796,16 @@ def update_icecast_metadata(mount, title):
             creds = base64.b64encode(f"{user}:{pw}".encode()).decode()
             req.add_header("Authorization", f"Basic {creds}")
             urllib.request.urlopen(req, timeout=3)
-            print(f"[daemon] Metadata updated: {mount} → {title}")
+            logger_daemon.info(f"Metadata updated: {mount} → {title}")
             return
         except urllib.error.HTTPError as e:
             if e.code != 401:
-                print(f"[daemon] Metadata update failed ({mount}): {e}")
+                logger_daemon.warning(f"Metadata update failed ({mount}): {e}")
                 return
         except Exception as e:
-            print(f"[daemon] Metadata update failed ({mount}): {e}")
+            logger_daemon.warning(f"Metadata update failed ({mount}): {e}")
             return
-    print(f"[daemon] Metadata update failed ({mount}): authentication failed")
+    logger_daemon.warning(f"Metadata update failed ({mount}): authentication failed")
 
 # ─── MUX switching ────────────────────────────────────────────────────────────
 
@@ -552,22 +818,22 @@ def get_mux(key):
 def switch_mux(mux_key):
     mux = get_mux(mux_key)
     if not mux:
-        print(f"[daemon] Unknown MUX: {mux_key}")
+        logger_daemon.warning(f"Unknown MUX: {mux_key}")
         return False
 
     def _do_switch():
         global current_mux_key
-        print(f"[daemon] Switching to: {mux['name']}")
+        logger_daemon.info(f"Switching to: {mux['name']}")
 
         with state_lock:
             stop_all_streams()
             start_welle(mux["channel"])
 
-        print(f"[daemon] Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
+        logger_daemon.info(f"Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
         raw_services = fetch_services_from_welle()
 
         if not raw_services:
-            print("[daemon] ERROR: No services found — check channel and reception")
+            logger_daemon.warning("ERROR: No services found — check channel and reception")
             return
 
         # Build and cache a clean service list
@@ -589,7 +855,7 @@ def switch_mux(mux_key):
                 start_stream(s)
             current_mux_key = mux_key
 
-        print(f"[daemon] Switch complete: {mux['name']} — {len(services)} active streams")
+        logger_daemon.info(f"Switch complete: {mux['name']} — {len(services)} active streams")
 
     threading.Thread(target=_do_switch, daemon=True).start()
     return True
@@ -607,7 +873,7 @@ def json_response(handler, code, data):
 class DABHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        print(f"[http] {self.address_string()} {fmt % args}")
+        logger_daemon.info(f"[http] {self.address_string()} {fmt % args}")
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -643,6 +909,39 @@ class DABHandler(BaseHTTPRequestHandler):
                 "current_mux":    current_mux_key,
                 "welle_alive":    welle_proc is not None and welle_proc.poll() is None,
                 "active_streams": active,
+            })
+
+        elif parsed.path == "/health":
+            with state_lock:
+                welle_alive = welle_proc is not None and welle_proc.poll() is None
+                streams = []
+                overall = "OK"
+                for mount, info in stream_procs.items():
+                    alive = info["ffmpeg"].poll() is None
+                    streams.append({
+                        "mount":           mount,
+                        "name":            info["service"]["name"],
+                        "ffmpeg_alive":    alive,
+                        "reconnect_count": info.get("reconnect_count", 0),
+                    })
+                    if not alive:
+                        overall = "CRITICAL"
+
+            with mux_json_lock:
+                data = latest_mux_json
+
+            snr = None
+            if data:
+                snr = data.get("snr")
+                if snr is not None and snr < SNR_WARNING_THRESHOLD:
+                    if overall == "OK":
+                        overall = "DEGRADED"
+
+            json_response(self, 200, {
+                "welle_status": welle_alive and "alive" or "unresponsive",
+                "signal_snr":  snr,
+                "streams":     streams,
+                "overall":     overall,
             })
 
         elif parsed.path == "/muxes":
@@ -712,14 +1011,14 @@ class DABHandler(BaseHTTPRequestHandler):
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 def shutdown_handler(sig, frame):
-    print("\n[daemon] shutting down...")
+    logger_daemon.info("shutting down...")
     stop_all_streams()
     stop_welle()
     os._exit(0)
 
 if __name__ == "__main__":
     if not MUX_LIST:
-        print("[daemon] ERROR: No MUXes configured")
+        logger_daemon.error("No MUXes configured")
         sys.exit(1)
 
     signal.signal(signal.SIGINT,  shutdown_handler)
@@ -730,8 +1029,13 @@ if __name__ == "__main__":
     threading.Thread(target=metadata_updater, daemon=True).start()
     threading.Thread(target=welle_watchdog,  daemon=True).start()
     threading.Thread(target=stream_watchdog, daemon=True).start()
-    print(f"[daemon] HTTP API on port {DAEMON_PORT}")
-    print(f"[daemon] Endpoints: /status  /muxes  /switch/<key>  /rescan  POST /stop")
+    threading.Thread(target=mux_json_fetcher, daemon=True).start()
+    threading.Thread(target=signal_quality_monitor, daemon=True).start()
+    threading.Thread(target=preventive_restart_scheduler, daemon=True).start()
+    threading.Thread(target=icecast_stats_poller, daemon=True).start()
+
+    logger_daemon.info(f"HTTP API on port {DAEMON_PORT}")
+    logger_daemon.info(f"Endpoints: /status  /health  /muxes  /switch/<key>  /rescan  POST /stop")
 
     switch_mux(MUX_LIST[0]["key"])
 
