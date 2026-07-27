@@ -2,7 +2,7 @@ services:
   dab-radio:
     # To use the pre-built image from GitHub Container Registry instead of
     # building locally, replace the 'build' block with:
-    #   image: ghcr.io/OWNER/rtl-dab-player:latest
+    #   image: ghcr.io/hsand/rtl-dab-player:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile

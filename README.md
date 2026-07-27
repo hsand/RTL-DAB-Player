@@ -44,8 +44,8 @@ sudo modprobe -r dvb_usb_rtl28xxu rtl2832 rtl2830
 Then:
 
 ```bash
-git clone https://github.com/OWNER/rtl-dab-player.git
-cd rtl-dab-player/docker
+git clone https://github.com/hsand/RTL-DAB-Player.git
+cd RTL-DAB-Player/docker
 cp .env.example .env      # set passwords, mux list, etc.
 docker compose up -d --build
 ```
@@ -55,7 +55,7 @@ The first build takes several minutes (welle-cli compiles from source). Once run
 - Web player: `http://<host>:9980`
 - Icecast streams: `http://<host>:8000/dab/<station-slug>` (status page at `http://<host>:8000/`)
 
-The GitHub Actions workflow in this repo also publishes multi-arch (amd64/arm64) images to `ghcr.io/OWNER/rtl-dab-player` on version tags, which you can use instead of building locally.
+The GitHub Actions workflow in this repo also publishes multi-arch (amd64/arm64) images to `ghcr.io/hsand/rtl-dab-player` on version tags, which you can use instead of building locally.
 
 ## Configuring multiplexes
 
