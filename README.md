@@ -6,6 +6,8 @@ RTL DAB Player receives a full DAB multiplex with [welle-cli](https://github.com
 
 *Based on [Lyrion_DAB_Radio](https://github.com/macsatcom/Lyrion_DAB_Radio) by Kasper S Nielsen; the LMS plugin has been replaced by a standalone web player.*
 
+![RTL DAB Player web UI](docs/screenshot.png)
+
 ## Features
 
 - **Web player** — station grid with broadcaster-sent logos/artwork (MOT slideshow), genre and bitrate per station, live "now playing" text (DLS), and click-to-play with a persistent bottom player bar
