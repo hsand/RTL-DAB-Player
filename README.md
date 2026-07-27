@@ -1,7 +1,5 @@
 # RTL DAB Player
 
-Turn a ~10 EUR RTL-SDR dongle into a whole-house DAB+ radio with a modern web player.
-
 RTL DAB Player receives a full DAB multiplex with [welle-cli](https://github.com/AlbrechtL/welle.io), decodes every station simultaneously, and serves them two ways: a built-in web UI with station logos, now-playing info and one-click playback, and permanent Icecast mounts that any network player (VLC, Sonos, Squeezebox, …) can tune into.
 
 *Based on [Lyrion_DAB_Radio](https://github.com/macsatcom/Lyrion_DAB_Radio) by Kasper S Nielsen; the LMS plugin has been replaced by a standalone web player.*
