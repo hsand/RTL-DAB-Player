@@ -286,7 +286,7 @@ function muxName(key) {
 }
 
 function slideSrc(st) {
-  return '/slide/' + st.sid + '?t=' + st.slide_ts;
+  return '/slide/' + (st.slide_sid || st.sid) + '?t=' + st.slide_ts;
 }
 
 async function init() {
@@ -859,6 +859,82 @@ def _log_signal_quality():
 
 # ─── Service discovery ───────────────────────────────────────────────────────
 
+def _subchannel_of(svc):
+    """Subchannel id carrying this service's audio, or None."""
+    for comp in svc.get("components") or []:
+        if comp.get("transportmode") != "audio":
+            continue
+        sub = comp.get("subchannel") or {}
+        if sub.get("subchid") is not None:
+            return sub["subchid"]
+    return None
+
+def source_sid_of(svc_info):
+    """SID whose welle-cli stream this service is actually pulled from."""
+    m = re.search(r"/mp3/(\S+)", svc_info.get("url_mp3") or "")
+    return m.group(1) if m else None
+
+def _is_decoding(svc):
+    """True if welle-cli is actually producing audio for this service.
+
+    A service welle-cli has bound a decoder to reports a real sample rate and
+    codec; one it hasn't reports samplerate 0 / mode "" and never serves data.
+    """
+    return bool(svc.get("samplerate")) and bool(svc.get("mode"))
+
+def resolve_audio_sources(services):
+    """Choose the welle-cli URL each service should be pulled from.
+
+    Broadcasters commonly announce several service IDs that share one
+    subchannel (e.g. "NRK P1" and "NRK P1 Stor-Oslo" both on subchid 50).
+    welle-cli binds the subchannel's decoder to a single SID, so requests for
+    the others hang forever. Point those services at the SID that is actually
+    being decoded — same audio, one Icecast mount each.
+
+    Returns (usable_services, skipped) where each usable service has had
+    'url_mp3' rewritten to a working source.
+    """
+    by_subch = {}
+    for svc in services:
+        by_subch.setdefault(_subchannel_of(svc), []).append(svc)
+
+    usable, skipped = [], []
+    for subch, group in by_subch.items():
+        # Prefer a service welle-cli is decoding; fall back to any if unknown.
+        source = next((s for s in group if _is_decoding(s)), None)
+
+        if source is None:
+            # No SID on this subchannel is being decoded. With a single
+            # service that usually just means welle-cli hasn't caught up yet,
+            # so keep it and let the stream watchdog sort it out. With
+            # several, only one could ever work and we can't tell which —
+            # take the first and drop its twins rather than spawn ffmpegs
+            # that hang forever.
+            if len(group) == 1:
+                usable.extend(group)
+                continue
+            source = group[0]
+            usable.append(source)
+            skipped.extend(s for s in group[1:])
+            continue
+
+        for svc in group:
+            if svc is source or _is_decoding(svc):
+                usable.append(svc)
+                continue
+            if not source.get("url_mp3"):
+                skipped.append(svc)
+                continue
+            svc = dict(svc, url_mp3=source["url_mp3"])
+            logger_daemon.info(
+                f"{svc['label']['label'].strip()} ({svc['sid']}) shares subchannel "
+                f"{subch} with {source['label']['label'].strip()} ({source['sid']}) "
+                f"— streaming from the latter"
+            )
+            usable.append(svc)
+
+    return usable, skipped
+
 def fetch_services_from_welle():
     """
     Poll welle-cli's /mux.json until the audio service list is stable.
@@ -961,6 +1037,8 @@ def start_stream(raw_svc):
         "mount":  mount,
         "genre":  genre,
         "codec":  desc,
+        # May differ from this service's own SID when a subchannel is shared
+        "url_mp3": raw_svc["url_mp3"],
         "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}{mount}",
     }
     stderr_thread = threading.Thread(
@@ -1017,6 +1095,11 @@ def metadata_updater():
 
             for sid, info in items:
                 raw = svc_by_sid.get(sid)
+                # Shared subchannel: DLS only exists on the decoded SID
+                if raw and not (raw.get("dls") or {}).get("label"):
+                    src_sid = source_sid_of(info["service"])
+                    if src_sid and src_sid != sid:
+                        raw = svc_by_sid.get(src_sid) or raw
                 if not raw:
                     continue
                 dls = (raw.get("dls") or {}).get("label", "").strip()
@@ -1129,7 +1212,8 @@ def start_stream_from_info(svc_info):
     raw_svc = {
         "label": {"label": svc_info["name"]},
         "sid":   svc_info["sid"],
-        "url_mp3": f"/mp3/{svc_info['sid']}",
+        # Keep the resolved source (see resolve_audio_sources)
+        "url_mp3": svc_info.get("url_mp3") or f"/mp3/{svc_info['sid']}",
         "ptystring": svc_info.get("genre", ""),
         "mode": svc_info.get("codec") or "DAB+ via RTL-SDR",
     }
@@ -1257,6 +1341,13 @@ def switch_mux(mux_key):
             )
             return
 
+        # Services sharing a subchannel can't all be pulled from their own SID
+        raw_services, skipped = resolve_audio_sources(raw_services)
+        for s in skipped:
+            logger_daemon.warning(
+                f"Skipping {s['label']['label'].strip()} ({s['sid']}) — no decodable audio"
+            )
+
         names = [s["label"]["label"].strip() for s in raw_services]
         register_slugs(names)
 
@@ -1320,9 +1411,12 @@ def build_now_payload():
             for sid, info in stream_procs.items()
         }
         snapshots = {k: v for k, v in station_snapshots.items()}
+        # sid -> sid it actually streams from (differs on shared subchannels)
+        sources = {sid: source_sid_of(info["service"]) for sid, info in stream_procs.items()}
 
     stations = []
     if data and welle_alive:
+        by_sid = {s.get("sid"): s for s in data.get("services", [])}
         for svc in data.get("services", []):
             if not svc.get("url_mp3"):
                 continue
@@ -1331,9 +1425,17 @@ def build_now_payload():
             if not name:
                 continue
             entry = streams.get(sid)
-            audio = svc.get("audiolevel") or {}
-            errs  = svc.get("errorcounters") or {}
-            mot   = svc.get("mot") or {}
+
+            # A service sharing another's subchannel has no metadata of its
+            # own — read DLS/slides/levels from the SID being decoded.
+            meta = svc
+            src_sid = sources.get(sid)
+            if src_sid and src_sid != sid and by_sid.get(src_sid):
+                meta = by_sid[src_sid]
+
+            audio = meta.get("audiolevel") or {}
+            errs  = meta.get("errorcounters") or {}
+            mot   = meta.get("mot") or {}
 
             bitrate = None
             for comp in svc.get("components") or []:
@@ -1348,11 +1450,13 @@ def build_now_payload():
                 "mount":      entry["mount"] if entry else mount_for(name, sid),
                 "streaming":  bool(entry and entry["alive"]),
                 "genre":      svc.get("ptystring") or "",
-                "codec":      svc.get("mode") or "",
-                "samplerate": svc.get("samplerate") or 0,
+                "codec":      meta.get("mode") or "",
+                "samplerate": meta.get("samplerate") or 0,
                 "bitrate":    bitrate,
-                "dls":        (svc.get("dls") or {}).get("label", "").strip(),
+                "dls":        (meta.get("dls") or {}).get("label", "").strip(),
                 "slide_ts":   mot.get("lastchange") or 0,
+                # Slides live under the decoded SID when a subchannel is shared
+                "slide_sid":  meta.get("sid") or sid,
                 "audio_db": {
                     "left":  round(linear_to_db(audio.get("left") or 0), 1),
                     "right": round(linear_to_db(audio.get("right") or 0), 1),
