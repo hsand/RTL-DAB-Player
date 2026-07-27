@@ -8,6 +8,9 @@ set -e
 : "${ICECAST_ADMIN_PASS:=changeme_admin}"
 : "${ICECAST_MOUNT:=/dab}"
 : "${ICECAST_PORT:=8000}"
+# Bytes sent instantly on connect. Lower = audio starts sooner but the
+# decoder has less to lock onto; higher = slower start. ~2s at DAB bitrates.
+: "${ICECAST_BURST_SIZE:=65536}"
 # Advertised in stream URLs on Icecast's status page. The container's own IP
 # is useless to LAN listeners, so this must be set explicitly to be useful.
 : "${ICECAST_HOSTNAME:=localhost}"
@@ -20,7 +23,7 @@ set -e
 : "${SNR_WARNING_THRESHOLD:=10}"
 : "${PREVENTIVE_RESTART_HOUR:=3}"
 
-export ICECAST_SOURCE ICECAST_ADMIN_PASS ICECAST_MOUNT ICECAST_PORT ICECAST_HOSTNAME
+export ICECAST_SOURCE ICECAST_ADMIN_PASS ICECAST_MOUNT ICECAST_PORT ICECAST_HOSTNAME ICECAST_BURST_SIZE
 export DAEMON_PORT DISCOVERY_TIMEOUT LISTEN_WAIT_TIMEOUT
 export LOG_DIR LOG_MAX_BYTES LOG_BACKUP_COUNT SNR_WARNING_THRESHOLD PREVENTIVE_RESTART_HOUR
 
@@ -41,7 +44,7 @@ if [ "$ICECAST_MODE" = "internal" ]; then
     export ICECAST_HOST=localhost
 
     # Generate icecast.xml from template
-    envsubst '${ICECAST_SOURCE} ${ICECAST_ADMIN_PASS} ${ICECAST_PORT} ${ICECAST_HOSTNAME}' \
+    envsubst '${ICECAST_SOURCE} ${ICECAST_ADMIN_PASS} ${ICECAST_PORT} ${ICECAST_HOSTNAME} ${ICECAST_BURST_SIZE}' \
         < /etc/icecast.xml.template \
         > /etc/icecast2/icecast.xml
 

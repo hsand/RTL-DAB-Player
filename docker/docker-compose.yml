@@ -29,6 +29,7 @@ services:
       # Set to this machine's LAN IP/name so the stream links on Icecast's
       # status page work for listeners (internal mode only).
       ICECAST_HOSTNAME:   ${ICECAST_HOSTNAME:-localhost}
+      ICECAST_BURST_SIZE: ${ICECAST_BURST_SIZE:-65536}
       # ── Daemon ──────────────────────────────────────────────────────────────
       DAEMON_PORT:        ${DAEMON_PORT:-9980}
       DISCOVERY_TIMEOUT:  ${DISCOVERY_TIMEOUT:-30}

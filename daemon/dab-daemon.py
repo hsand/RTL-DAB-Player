@@ -141,8 +141,7 @@ else:
 
 # ─── Web UI ───────────────────────────────────────────────────────────────────
 
-WEB_UI_HTML = """\
-<!DOCTYPE html>
+WEB_UI_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -206,10 +205,63 @@ WEB_UI_HTML = """\
   }
   .art .ph { font-size: 2.4rem; font-weight: 800; color: var(--faint); letter-spacing: 0.05em; }
   .art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  .meta { padding: 0.6rem 0.7rem 0.7rem; }
-  .name { font-weight: 650; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sub  { color: var(--dim); font-size: 0.72rem; margin-top: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .dls  { color: var(--accent); font-size: 0.78rem; margin-top: 0.3rem; min-height: 1.05rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* One gap value drives the spacing between every line in a card. */
+  .meta {
+    padding: 0.65rem 0.7rem 0.75rem;
+    display: flex; flex-direction: column; gap: 0.32rem;
+  }
+  .name { font-weight: 650; font-size: 0.95rem; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Always reserve the row, even when a station reports no genre, so the
+     codec line and song title sit at the same height on every card. */
+  .sub  {
+    color: var(--dim); font-size: 0.72rem; line-height: 1.25; min-height: 0.9rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* The codec line wraps to two rows on typical card widths; pin it to two
+     so cards stay aligned whether or not it happens to wrap. */
+  .sub.tech {
+    white-space: normal; text-overflow: clip;
+    height: 2.25rem;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  }
+  .dls  {
+    color: var(--accent); font-size: 0.78rem; line-height: 1.25; min-height: 1.05rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* While a title is scrolling, ellipsis would clash with the moving text —
+     fade it out at the right edge instead. */
+  .card.playing .dls.marquee, .card:hover .dls.marquee, #bar-dls.marquee {
+    text-overflow: clip;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+  }
+  /* Marquee: the inner span slides left by exactly its overflow, pausing at
+     each end. --shift and --dur are set per element from measured widths so
+     every title scrolls at the same speed. */
+  /* The keyframes are generated per element (see buildMarqueeKeyframes) so
+     the pause at each end is a fixed duration while travel time scales with
+     distance — long titles don't sit still for ages before moving. */
+  /* Scrolling everywhere at once is noisy, so it only runs on the station
+     being played, on hover, and in the player bar.
+     The delay is identical for the hover and playing states: clicking a card
+     you are hovering must not restart the animation from the beginning. It is
+     negative, which seeks past the keyframes' opening hold so scrolling
+     starts promptly, while still leaving a beat before it twitches. */
+  .marquee > span { display: inline-block; }
+  .card.playing .marquee > span,
+  .card:hover .marquee > span {
+    will-change: transform;
+    animation: var(--anim) var(--dur) linear infinite;
+    animation-delay: calc(0.35s - var(--hold, 1.6s));
+  }
+  #bar-dls.marquee > span {
+    will-change: transform;
+    animation: var(--anim) var(--dur) linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .marquee > span { animation: none; }
+    .dls { text-overflow: ellipsis; }
+  }
   #player-bar {
     position: fixed; bottom: 0; left: 0; right: 0; display: none;
     background: rgba(13, 17, 23, 0.96); backdrop-filter: blur(8px);
@@ -227,7 +279,7 @@ WEB_UI_HTML = """\
   #bar-art img { width: 100%; height: 100%; object-fit: contain; }
   #bar-text { min-width: 0; flex: 1; }
   #bar-name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #bar-dls  { color: var(--accent); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1.05rem; }
+  #bar-dls  { color: var(--accent); font-size: 0.8rem; white-space: nowrap; overflow: hidden; min-height: 1.05rem; }
   #bar-dls.note { color: var(--dim); font-style: italic; }
   .card.offline .art { opacity: 0.45; }
   audio { flex: 1 1 300px; max-width: 380px; height: 40px; }
@@ -257,7 +309,8 @@ WEB_UI_HTML = """\
       <div id="bar-name"></div>
       <div id="bar-dls"></div>
     </div>
-    <audio id="player" controls></audio>
+    <!-- preload=none: don't buffer anything until a station is clicked -->
+    <audio id="player" controls preload="none"></audio>
   </div>
 </div>
 
@@ -294,7 +347,13 @@ async function init() {
   // /listen holds the connection until the stream is live, so playback that
   // starts inside the click just buffers until audio flows. These handlers
   // only cover the rare failure cases (e.g. /listen gave up after 90 s).
-  p.addEventListener('playing', () => { pendingPlay = null; setBarNote(''); });
+  // Audio started: swap any waiting/reconnecting note straight to the song
+  // title. Clearing to empty here would blank a title that is already shown
+  // until the next poll repaints it.
+  p.addEventListener('playing', () => {
+    pendingPlay = null;
+    if ($('bar-dls').classList.contains('note')) setBarDls(currentDls());
+  });
   // A live stream that ends (ffmpeg/Icecast restart) or errors: reconnect
   // rather than sit silently looking like it is still playing.
   p.addEventListener('ended', () => { if (playing) reconnect(); });
@@ -442,10 +501,26 @@ function makeArt(st, el) {
 }
 
 function bitrateLine(st) {
-  if (st.bitrate) return st.bitrate + ' kbit/s';
-  // fall back to the part of welle's mode string after '@', e.g. "72 kbit/s"
-  const i = (st.codec || '').indexOf('@');
-  return i >= 0 ? st.codec.slice(i + 1).trim() : '';
+  // welle's mode string looks like "HE-AAC, 48 kHz Stereo @ 80 kbit/s".
+  // Show: "DAB+ · HE-AAC · 48 kHz stereo · 80 kbit/s"
+  const bits = [];
+  if (st.ascty) bits.push(st.ascty);
+
+  const mode = st.codec || '';
+  const m = mode.match(/^([^,]+),\s*([\d.]+)\s*kHz\s*(\w+)?/i);
+  if (m) {
+    bits.push(m[1].trim());                        // HE-AAC / AAC-LC / MP2
+    let rate = m[2] + ' kHz';
+    if (m[3]) rate += ' ' + m[3].toLowerCase();    // stereo / mono
+    bits.push(rate);
+  } else if (mode) {
+    bits.push(mode.split('@')[0].trim());
+  }
+
+  if (st.bitrate) bits.push(st.bitrate + ' kbit/s');
+  else if (mode.includes('@')) bits.push(mode.split('@')[1].trim());
+
+  return bits.join(' · ');
 }
 
 function renderSnapshot(muxKey) {
@@ -483,7 +558,7 @@ function buildGrid(stations) {
     genre.className = 'sub';
     genre.textContent = st.genre || '';
     const br = document.createElement('div');
-    br.className = 'sub';
+    br.className = 'sub tech';
     br.textContent = bitrateLine(st);
     const dls = document.createElement('div');
     dls.className = 'dls';
@@ -504,8 +579,7 @@ function updateGrid(stations) {
     const ref = cardRefs[st.sid];
     if (!ref) continue;
 
-    ref.dlsEl.textContent = st.dls || '';
-    ref.dlsEl.title = st.dls || '';
+    setScrollingText(ref.dlsEl, st.dls || '');
     ref.genreEl.textContent = st.genre || '';
     ref.brEl.textContent = bitrateLine(st);
     ref.cardEl.classList.toggle('playing', !!playing && playing.sid === st.sid);
@@ -524,7 +598,7 @@ function updateGrid(stations) {
 
     // Don't clobber "Waiting for stream…"/"Reconnecting…" with live DLS.
     if (playing && playing.sid === st.sid && !pendingPlay && !$('bar-dls').classList.contains('note')) {
-      $('bar-dls').textContent = st.dls || '';
+      setBarDls(st.dls || '');
       updateMediaSession(st);
     }
   }
@@ -545,19 +619,99 @@ function play(st) {
   const p = $('player');
   p.src = '/listen/' + st.sid;
   p.play().catch(() => {});
-  if (pendingPlay) {
+  if (pendingPlay && !st.dls) {
+    // Nothing better to show while we wait for the stream to come up.
     setBarNote(switching ? 'Starts when tuning finishes…' : 'Waiting for stream…');
   } else {
-    setBarNote('');
-    $('bar-dls').textContent = st.dls || '';
+    setBarDls(st.dls || '');
     updateMediaSession(st);
   }
 }
 
+const MARQUEE_PX_PER_SEC = 28;   // scroll speed; lower is slower
+const MARQUEE_HOLD_SEC   = 1.6;  // pause at each end
+
+// Each distinct travel distance needs its own @keyframes, because the
+// percentage of the cycle spent paused depends on the total duration.
+const marqueeRules = new Map();
+
+function marqueeAnimation(travel, dur) {
+  const name = 'mq' + Math.round(travel);
+  if (!marqueeRules.has(name)) {
+    // Cap the pause share so the four stops stay in order on short travels.
+    const hold = Math.min((MARQUEE_HOLD_SEC / dur) * 100, 24);
+    const p1 = hold.toFixed(2);
+    const p2 = (50 - hold / 2).toFixed(2) ;
+    const p3 = (50 + hold / 2).toFixed(2);
+    const p4 = (100 - hold).toFixed(2);
+    const css =
+      '@keyframes ' + name + '{' +
+      '0%,' + p1 + '%{transform:translateX(0)}' +
+      p2 + '%,' + p3 + '%{transform:translateX(' + (-travel) + 'px)}' +
+      p4 + '%,100%{transform:translateX(0)}}';
+    try {
+      const sheet = document.styleSheets[0];
+      sheet.insertRule(css, sheet.cssRules.length);
+    } catch (e) {
+      return '';   // no marquee rather than a broken animation
+    }
+    marqueeRules.set(name, true);
+  }
+  return name;
+}
+
+function setScrollingText(el, text) {
+  if (el.dataset.text === text) return;   // don't restart the animation
+  el.dataset.text = text;
+  el.classList.remove('marquee');
+  el.style.removeProperty('--shift');
+  el.style.removeProperty('--dur');
+  el.textContent = '';
+  if (!text) return;
+
+  const span = document.createElement('span');
+  span.textContent = text;
+  el.appendChild(span);
+  el.title = text;
+
+  // Measure after layout; scroll only if the text really doesn't fit.
+  // Compare the inline-block span's own width to the container: the span
+  // sizes to its content, so its scrollWidth is never larger than itself.
+  requestAnimationFrame(() => {
+    if (el.dataset.text !== text) return;
+    const overflow = span.getBoundingClientRect().width - el.clientWidth;
+    if (overflow <= 1) return;
+    const travel = Math.round(overflow + 8);   // breathing room at the end
+    // Out and back at a constant speed, plus a fixed pause at each end.
+    const dur = (travel / MARQUEE_PX_PER_SEC) * 2 + MARQUEE_HOLD_SEC * 2;
+    const anim = marqueeAnimation(travel, dur);
+    if (!anim) { el.style.textOverflow = 'ellipsis'; return; }
+    el.style.setProperty('--dur', dur.toFixed(2) + 's');
+    el.style.setProperty('--anim', anim);
+    // Actual opening hold in seconds (capped for short travels — see
+    // marqueeAnimation); hover seeks past it.
+    const holdPct = Math.min((MARQUEE_HOLD_SEC / dur) * 100, 24);
+    el.style.setProperty('--hold', (dur * holdPct / 100).toFixed(2) + 's');
+    el.classList.add('marquee');
+  });
+}
+
 function setBarNote(text) {
   const el = $('bar-dls');
-  el.textContent = text;
+  setScrollingText(el, text);
   el.classList.toggle('note', !!text);
+}
+
+function currentDls() {
+  if (!playing || !lastNow) return '';
+  const st = (lastNow.stations || []).find((s) => s.sid === playing.sid);
+  return (st && st.dls) || '';
+}
+
+function setBarDls(text) {
+  const el = $('bar-dls');
+  el.classList.remove('note');
+  setScrollingText(el, text);
 }
 
 function reconnect() {
@@ -572,16 +726,37 @@ function reconnect() {
 function setBarArt(st) {
   barArtTs = st.slide_ts || 0;
   const barArt = $('bar-art');
-  barArt.innerHTML = '';
-  if (st.slide_ts > 0) {
-    const img = document.createElement('img');
-    img.alt = '';
-    img.onerror = () => { img.remove(); barArt.textContent = initials(st.name); };
-    img.src = slideSrc(st);
-    barArt.appendChild(img);
-  } else {
+
+  if (!(st.slide_ts > 0)) {
     barArt.textContent = initials(st.name);
+    return;
   }
+
+  const src = slideSrc(st);
+  // Reuse the already-decoded image from the station's card when we have it,
+  // so the logo appears immediately instead of blanking while a fresh <img>
+  // loads (even a cached fetch costs a decode + paint).
+  const ref = cardRefs[st.sid];
+  const cardImg = ref && ref.artEl ? ref.artEl.querySelector('img') : null;
+  if (cardImg && cardImg.complete && cardImg.naturalWidth && cardImg.src === new URL(src, location.href).href) {
+    barArt.textContent = '';
+    barArt.appendChild(cardImg.cloneNode(true));
+    return;
+  }
+
+  const img = new Image();
+  img.alt = '';
+  img.onload = () => {
+    if (barArtTs !== (st.slide_ts || 0)) return;   // superseded
+    barArt.textContent = '';
+    barArt.appendChild(img);
+  };
+  img.onerror = () => {
+    if (barArtTs === (st.slide_ts || 0)) barArt.textContent = initials(st.name);
+  };
+  img.src = src;
+  // Keep whatever is showing (old logo or initials) until the new one loads.
+  if (!barArt.firstChild) barArt.textContent = initials(st.name);
 }
 
 let mediaSig = '';
@@ -1438,11 +1613,17 @@ def build_now_payload():
             mot   = meta.get("mot") or {}
 
             bitrate = None
+            ascty = ""
+            protection = ""
             for comp in svc.get("components") or []:
+                if comp.get("transportmode") != "audio":
+                    continue
+                ascty = comp.get("ascty") or ""       # "DAB" (MP2) or "DAB+" (AAC)
                 sub = comp.get("subchannel") or {}
+                protection = sub.get("protection") or ""
                 if sub.get("bitrate"):
                     bitrate = sub["bitrate"]
-                    break
+                break
 
             stations.append({
                 "sid":        sid,
@@ -1453,6 +1634,9 @@ def build_now_payload():
                 "codec":      meta.get("mode") or "",
                 "samplerate": meta.get("samplerate") or 0,
                 "bitrate":    bitrate,
+                "ascty":      ascty,
+                "protection": protection,
+                "channels":   meta.get("channels") or 0,
                 "dls":        (meta.get("dls") or {}).get("label", "").strip(),
                 "slide_ts":   mot.get("lastchange") or 0,
                 # Slides live under the decoded SID when a subchannel is shared
@@ -1512,6 +1696,10 @@ def json_response(handler, code, data):
     handler.wfile.write(body)
 
 class DABHandler(BaseHTTPRequestHandler):
+
+    # HTTP/1.1 so streaming responses aren't treated as "read until close":
+    # on HTTP/1.0 browsers buffer far more before starting playback.
+    protocol_version = "HTTP/1.1"
 
     # Don't let a client that opens a socket and never sends a request pin a
     # thread forever (BaseHTTPRequestHandler defaults to no timeout).
@@ -1621,6 +1809,10 @@ class DABHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", upstream.headers.get("Content-Type", "audio/mpeg"))
                 self.send_header("Cache-Control", "no-store")
+                # An endless body has no Content-Length, so under HTTP/1.1 the
+                # connection must be explicitly marked close-delimited.
+                self.send_header("Connection", "close")
+                self.close_connection = True
                 self.end_headers()
                 while True:
                     chunk = upstream.read(8192)

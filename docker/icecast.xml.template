@@ -6,8 +6,12 @@
         <clients>200</clients>
         <sources>64</sources>
         <queue-size>524288</queue-size>
+        <!-- Sent instantly on connect to fill the player's pre-buffer, so
+             playback starts without waiting for live audio to trickle in.
+             Larger = faster start, further behind real time. See
+             ICECAST_BURST_SIZE in .env.example. -->
         <burst-on-connect>1</burst-on-connect>
-        <burst-size>65536</burst-size>
+        <burst-size>${ICECAST_BURST_SIZE}</burst-size>
     </limits>
 
     <authentication>
