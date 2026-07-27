@@ -1,8 +1,8 @@
-# DAB Radio Daemon — Docker image
+# RTL DAB Player — Docker image
 # Includes: welle-cli (built from source), ffmpeg, Icecast2, Python3
 #
 # Build context must be the repository root:
-#   docker build -f docker/Dockerfile -t dab-radio .
+#   docker build -f docker/Dockerfile -t rtl-dab-player .
 #
 # Normally you use docker-compose instead — see docker-compose.yml.
 

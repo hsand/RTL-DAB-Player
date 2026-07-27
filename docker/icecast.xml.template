@@ -3,8 +3,8 @@
     <admin>admin@localhost</admin>
 
     <limits>
-        <clients>100</clients>
-        <sources>5</sources>
+        <clients>200</clients>
+        <sources>64</sources>
         <queue-size>524288</queue-size>
         <burst-on-connect>1</burst-on-connect>
         <burst-size>65536</burst-size>
@@ -18,6 +18,14 @@
     </authentication>
 
     <hostname>localhost</hostname>
+
+    <paths>
+        <basedir>/usr/share/icecast2</basedir>
+        <webroot>/usr/share/icecast2/web</webroot>
+        <adminroot>/usr/share/icecast2/admin</adminroot>
+        <logdir>/var/log/icecast2</logdir>
+        <alias source="/" destination="/status.xsl"/>
+    </paths>
 
     <listen-socket>
         <port>8000</port>

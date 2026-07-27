@@ -1,5 +1,5 @@
 [Unit]
-Description=DAB Radio Daemon
+Description=RTL DAB Player daemon
 After=network.target
 
 [Service]

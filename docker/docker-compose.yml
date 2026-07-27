@@ -2,7 +2,7 @@ services:
   dab-radio:
     # To use the pre-built image from GitHub Container Registry instead of
     # building locally, replace the 'build' block with:
-    #   image: ghcr.io/macsatcom/lyrion-dab-radio:latest
+    #   image: ghcr.io/OWNER/rtl-dab-player:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -28,7 +28,10 @@ services:
       ICECAST_MOUNT:      ${ICECAST_MOUNT:-/dab}
       # ── Daemon ──────────────────────────────────────────────────────────────
       DAEMON_PORT:        ${DAEMON_PORT:-9980}
-      # ── MUX list (optional JSON override) ───────────────────────────────────
+      # ── MUX list ────────────────────────────────────────────────────────────
+      # Set MUX_LIST in docker/.env (see .env.example) to the ensembles
+      # receivable in your area, e.g.:
+      #   MUX_LIST=[{"key":"mux1","name":"My MUX (10B)","channel":"10B"}]
       MUX_LIST:           ${MUX_LIST:-}
     volumes:
       - ./logs:/var/log/dabservice  # Map container logs to host directory
