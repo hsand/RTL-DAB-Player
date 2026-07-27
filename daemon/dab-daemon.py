@@ -56,6 +56,9 @@ ICECAST_MOUNT_BASE = os.environ.get("ICECAST_MOUNT",   "/dab")
 # How long to wait for welle-cli to discover services
 DISCOVERY_TIMEOUT  = int(os.environ.get("DISCOVERY_TIMEOUT", "30"))
 
+# How long /listen holds a connection waiting for a stream to come up
+LISTEN_WAIT_TIMEOUT = int(os.environ.get("LISTEN_WAIT_TIMEOUT", "90"))
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 LOG_DIR           = os.environ.get("LOG_DIR", "/var/log/dabservice")
@@ -203,11 +206,6 @@ WEB_UI_HTML = """\
   }
   .art .ph { font-size: 2.4rem; font-weight: 800; color: var(--faint); letter-spacing: 0.05em; }
   .art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  .badge {
-    position: absolute; top: 0.45rem; right: 0.45rem; z-index: 2;
-    font-size: 0.65rem; font-weight: 700; padding: 0.15rem 0.45rem; border-radius: 999px;
-  }
-  .badge.err { background: rgba(248, 81, 73, 0.9); color: #fff; }
   .meta { padding: 0.6rem 0.7rem 0.7rem; }
   .name { font-weight: 650; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sub  { color: var(--dim); font-size: 0.72rem; margin-top: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -230,6 +228,8 @@ WEB_UI_HTML = """\
   #bar-text { min-width: 0; flex: 1; }
   #bar-name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #bar-dls  { color: var(--accent); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1.05rem; }
+  #bar-dls.note { color: var(--dim); font-style: italic; }
+  .card.offline .art { opacity: 0.45; }
   audio { flex: 1 1 300px; max-width: 380px; height: 40px; }
   @media (max-width: 640px) {
     body { padding: 1rem 1rem 9rem; }
@@ -294,10 +294,13 @@ async function init() {
   // /listen holds the connection until the stream is live, so playback that
   // starts inside the click just buffers until audio flows. These handlers
   // only cover the rare failure cases (e.g. /listen gave up after 90 s).
-  p.addEventListener('playing', () => { pendingPlay = null; });
+  p.addEventListener('playing', () => { pendingPlay = null; setBarNote(''); });
+  // A live stream that ends (ffmpeg/Icecast restart) or errors: reconnect
+  // rather than sit silently looking like it is still playing.
+  p.addEventListener('ended', () => { if (playing) reconnect(); });
   p.addEventListener('error', () => {
     setTimeout(() => {
-      if (pendingPlay && p.src) {
+      if ((pendingPlay || playing) && p.src) {
         p.load();
         p.play().catch(() => {});
       }
@@ -315,7 +318,7 @@ async function tick() {
       fetch('/muxes').then((r) => r.json()),
     ]);
   } catch (e) {
-    setMsg('Daemon unreachable&hellip;');
+    setMsg('Daemon unreachable…');
     return;
   }
 
@@ -324,6 +327,13 @@ async function tick() {
   lastNow = now;
 
   if (now.switching_to) {
+    if (!switching) {
+      // Switch started elsewhere (another browser, API call, watchdog):
+      // our stream is going away, so don't keep showing it as playing.
+      switchStarted = Date.now();
+      stopPlayback();
+      gridSig = '';
+    }
     switching = true;
     pendingMux = now.switching_to;
   } else if (switching && currentMux === pendingMux) {
@@ -361,21 +371,27 @@ async function tick() {
   }
 
   if (!now.welle_alive) setMsg('Receiver stopped.');
-  else if (!now.stations.length) setMsg(spinnerMsg('Scanning for stations'));
+  else if (!now.stations.length) setMsg('Scanning for stations…', true);
   else setMsg('');
-}
-
-function spinnerMsg(text) {
-  return '<span class="spin"></span>' + text + '&hellip;';
 }
 
 function showSwitchingState() {
   const n = renderSnapshot(pendingMux);
   $('grid').classList.add('ghost');
-  setMsg(n ? '' : spinnerMsg('Tuning ' + muxName(pendingMux)));
+  setMsg(n ? '' : 'Tuning ' + muxName(pendingMux) + '…', true);
 }
 
-function setMsg(html) { $('msg').innerHTML = html; }
+function setMsg(text, spinner) {
+  const el = $('msg');
+  el.textContent = '';
+  if (!text) return;
+  if (spinner) {
+    const s = document.createElement('span');
+    s.className = 'spin';
+    el.appendChild(s);
+  }
+  el.appendChild(document.createTextNode(text));
+}
 
 function renderHeader(now) {
   $('ensemble').textContent = now.ensemble || '';
@@ -413,7 +429,13 @@ function makeArt(st, el) {
   if (st.slide_ts > 0) {
     const img = document.createElement('img');
     img.alt = '';
-    img.onerror = () => img.remove();
+    // Failed fetch (welle busy, slide not ready): drop the img and forget the
+    // timestamp so the next poll retries instead of waiting for a new slide.
+    img.onerror = () => {
+      img.remove();
+      const ref = cardRefs[st.sid];
+      if (ref) ref.imgTs = 0;
+    };
     img.src = slideSrc(st);
     el.appendChild(img);
   }
@@ -487,6 +509,8 @@ function updateGrid(stations) {
     ref.genreEl.textContent = st.genre || '';
     ref.brEl.textContent = bitrateLine(st);
     ref.cardEl.classList.toggle('playing', !!playing && playing.sid === st.sid);
+    ref.cardEl.classList.toggle('offline', !st.streaming);
+    ref.cardEl.title = st.streaming ? '' : 'Stream not running';
 
     if (st.slide_ts > 0 && st.slide_ts !== ref.imgTs) {
       ref.imgTs = st.slide_ts;
@@ -498,7 +522,8 @@ function updateGrid(stations) {
       setBarArt(st);
     }
 
-    if (playing && playing.sid === st.sid) {
+    // Don't clobber "Waiting for stream…"/"Reconnecting…" with live DLS.
+    if (playing && playing.sid === st.sid && !pendingPlay && !$('bar-dls').classList.contains('note')) {
       $('bar-dls').textContent = st.dls || '';
       updateMediaSession(st);
     }
@@ -521,11 +546,27 @@ function play(st) {
   p.src = '/listen/' + st.sid;
   p.play().catch(() => {});
   if (pendingPlay) {
-    $('bar-dls').textContent = 'Starts when tuning finishes…';
+    setBarNote(switching ? 'Starts when tuning finishes…' : 'Waiting for stream…');
   } else {
+    setBarNote('');
     $('bar-dls').textContent = st.dls || '';
     updateMediaSession(st);
   }
+}
+
+function setBarNote(text) {
+  const el = $('bar-dls');
+  el.textContent = text;
+  el.classList.toggle('note', !!text);
+}
+
+function reconnect() {
+  // /listen waits server-side for the stream to come back, so a plain
+  // re-request is enough — no user gesture needed, the element is unlocked.
+  const p = $('player');
+  setBarNote('Reconnecting…');
+  p.load();
+  p.play().catch(() => {});
 }
 
 function setBarArt(st) {
@@ -543,8 +584,12 @@ function setBarArt(st) {
   }
 }
 
+let mediaSig = '';
 function updateMediaSession(st) {
   if (!('mediaSession' in navigator)) return;
+  const sig = st.sid + '|' + (st.dls || '') + '|' + st.slide_ts;
+  if (sig === mediaSig) return;   // avoid re-fetching artwork every tick
+  mediaSig = sig;
   try {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: st.dls || st.name,
@@ -594,8 +639,10 @@ welle_stderr_thread = None
 # something immediately while a switch is in progress.
 station_snapshots = {}
 switching_to      = None  # target mux key while a switch is running, else None
-stream_procs    = {}   # mount → {"ffmpeg": proc, "service": svc_dict, "stderr_thread": thread, "reconnect_count": int}
-dls_state       = {}   # mount → last known DLS string
+switch_lock       = threading.Lock()   # serializes switches (one tuner)
+desired_mux_key   = None  # mux we *want* tuned; None after an explicit /stop
+stream_procs    = {}   # sid → {"ffmpeg": proc, "service": svc_dict, "stderr_thread": thread, "reconnect_count": int}
+dls_state       = {}   # sid → last known DLS string
 state_lock      = threading.Lock()
 
 # Consolidated mux.json cache
@@ -604,7 +651,7 @@ mux_json_lock   = threading.Lock()
 mux_json_event  = threading.Event()
 
 # Signal quality tracking
-prev_error_counters = {}  # mount → {frameerrors, rserrors, aacerrors}
+prev_error_counters = {}  # sid → {frameerrors, rserrors, aacerrors}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -615,6 +662,30 @@ def slugify(name):
     s = re.sub(r'[åÅ]', 'aa', s)
     s = re.sub(r'[^a-z0-9]+', '-', s)
     return s.strip('-') or 'service'
+
+# Station labels are not unique once slugified ("NRK P1" and "NRK P1+" both
+# become "nrk-p1"), which would make two ffmpeg processes fight over one
+# Icecast mount. Slugs that collide within a mux get their SID appended.
+_ambiguous_slugs = set()
+_slug_lock       = threading.Lock()
+
+def register_slugs(names):
+    """Record which slugs are shared by more than one station in this mux."""
+    counts = {}
+    for n in names:
+        counts[slugify(n)] = counts.get(slugify(n), 0) + 1
+    with _slug_lock:
+        _ambiguous_slugs.clear()
+        _ambiguous_slugs.update(s for s, c in counts.items() if c > 1)
+
+def mount_for(name, sid):
+    """Icecast mount path for a station, unique within the mux."""
+    slug = slugify(name)
+    with _slug_lock:
+        ambiguous = slug in _ambiguous_slugs
+    if ambiguous:
+        slug = f"{slug}-{str(sid).lower().replace('0x', '')}"
+    return f"{ICECAST_MOUNT_BASE}/{slug}"
 
 def fetch_json_with_close(url, timeout=3):
     """Fetch JSON from welle-cli and always close the response."""
@@ -696,9 +767,11 @@ def mux_json_fetcher():
     """Single background thread that fetches mux.json periodically and caches it."""
     while True:
         time.sleep(5)
-        if not welle_proc or welle_proc.poll() is not None:
-            continue
         try:
+            with state_lock:
+                proc = welle_proc
+            if proc is None or proc.poll() is not None:
+                continue
             resp = urllib.request.urlopen(
                 f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=5
             )
@@ -717,67 +790,72 @@ def signal_quality_monitor():
     """Polls cached mux.json and logs signal quality metrics."""
     while True:
         time.sleep(10)
-        with mux_json_lock:
-            data = latest_mux_json
+        try:
+            _log_signal_quality()
+        except Exception:
+            logger_daemon.error(f"signal_quality_monitor iteration failed:\n{traceback.format_exc()}")
 
-        if not data:
+def _log_signal_quality():
+    with mux_json_lock:
+        data = latest_mux_json
+
+    if not data:
+        return
+
+    # Global metrics (under "demodulator" in welle-cli's mux.json)
+    demod = data.get("demodulator") or {}
+    snr = demod.get("snr")
+    freq_corr = demod.get("frequencycorrection")
+
+    if snr is not None:
+        msg = f"SNR={snr:.1f} dB"
+        if freq_corr is not None:
+            msg += f", freq_corr={freq_corr} Hz"
+
+        if snr < SNR_WARNING_THRESHOLD:
+            logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
+        else:
+            logger_signal.info(msg)
+
+    # Per-service metrics
+    services = data.get("services", [])
+    for svc in services:
+        if not svc.get("url_mp3"):
             continue
+        name = svc.get("label", {}).get("label", "unknown")
+        sid = svc.get("sid")
 
-        # Global metrics (under "demodulator" in welle-cli's mux.json)
-        demod = data.get("demodulator") or {}
-        snr = demod.get("snr")
-        freq_corr = demod.get("frequencycorrection")
+        audio = svc.get("audiolevel") or {}
+        left_linear = audio.get("left") or 0
+        right_linear = audio.get("right") or 0
+        left_db = linear_to_db(left_linear)
+        right_db = linear_to_db(right_linear)
 
-        if snr is not None:
-            msg = f"SNR={snr:.1f} dB"
-            if freq_corr is not None:
-                msg += f", freq_corr={freq_corr} Hz"
+        errs = svc.get("errorcounters") or {}
+        fe = errs.get("frameerrors", 0)
+        rs = errs.get("rserrors", 0)
+        aac = errs.get("aacerrors", 0)
 
-            if snr < SNR_WARNING_THRESHOLD:
-                logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
-            else:
-                logger_signal.info(msg)
+        log_msg = f"{name} (SID={sid}) audio_left={left_db:.1f} dBFS audio_right={right_db:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
+        logger_signal.info(log_msg)
 
-        # Per-service metrics
-        services = data.get("services", [])
-        for svc in services:
-            if not svc.get("url_mp3"):
-                continue
-            name = svc.get("label", {}).get("label", "unknown")
-            sid = svc.get("sid")
-            mount = f"/dab/{slugify(name)}"
+        # Check for warnings
+        if left_db < -60 or right_db < -60:
+            logger_signal.warning(f"{name} audio level very low (silence?): left={left_db:.1f}, right={right_db:.1f}")
 
-            audio = svc.get("audiolevel", {})
-            left_linear = audio.get("left", 0)
-            right_linear = audio.get("right", 0)
-            left_db = linear_to_db(left_linear)
-            right_db = linear_to_db(right_linear)
+        prev = prev_error_counters.get(sid, {})
+        if prev:
+            df = fe - prev.get("frameerrors", 0)
+            dr = rs - prev.get("rserrors", 0)
+            da = aac - prev.get("aacerrors", 0)
+            if df > 5 or dr > 5 or da > 5:
+                logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
 
-            errs = svc.get("errorcounters", {})
-            fe = errs.get("frameerrors", 0)
-            rs = errs.get("rserrors", 0)
-            aac = errs.get("aacerrors", 0)
+        # High RS errors directly cause audio glitches/dropouts
+        if rs > 100:
+            logger_signal.warning(f"{name} HIGH RS errors ({rs}) — expect audio dropouts/glitches")
 
-            log_msg = f"{name} (SID={sid}) audio_left={left_db:.1f} dBFS audio_right={right_db:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
-            logger_signal.info(log_msg)
-
-            # Check for warnings
-            if left_db < -60 or right_db < -60:
-                logger_signal.warning(f"{name} audio level very low (silence?): left={left_db:.1f}, right={right_db:.1f}")
-
-            prev = prev_error_counters.get(mount, {})
-            if prev:
-                df = fe - prev.get("frameerrors", 0)
-                dr = rs - prev.get("rserrors", 0)
-                da = aac - prev.get("aacerrors", 0)
-                if df > 5 or dr > 5 or da > 5:
-                    logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
-
-            # High RS errors directly cause audio glitches/dropouts
-            if rs > 100:
-                logger_signal.warning(f"{name} HIGH RS errors ({rs}) — expect audio dropouts/glitches")
-
-            prev_error_counters[mount] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
+        prev_error_counters[sid] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
 
 # ─── Service discovery ───────────────────────────────────────────────────────
 
@@ -825,11 +903,17 @@ def fetch_services_from_welle():
 
 FFMPEG_ERROR_KEYWORDS = ['error', 'failed', 'reconnect', 'buffer', 'underflow', 'overflow', 'dropped', 'discontinuity']
 
+_CRED_RE = re.compile(r"(icecast://[^:@/\s]+):[^@/\s]*@")
+
+def redact(text):
+    """Strip the Icecast source password out of anything we log."""
+    return _CRED_RE.sub(r"\1:***@", text)
+
 def read_ffmpeg_stderr(proc, mount, name):
     """Read ffmpeg stderr and log relevant lines."""
     try:
         for line in proc.stderr:
-            line = line.decode('utf-8', errors='replace').strip()
+            line = redact(line.decode('utf-8', errors='replace').strip())
             if not line:
                 continue
             lower = line.lower()
@@ -844,12 +928,15 @@ def start_stream(raw_svc):
     """Pull MP3 from welle-cli and push to Icecast."""
     name  = raw_svc["label"]["label"].strip()
     sid   = raw_svc["sid"]
-    mount = f"/dab/{slugify(name)}"
+    mount = mount_for(name, sid)
     src   = f"http://127.0.0.1:{WELLE_PORT}{raw_svc['url_mp3']}"
 
     genre = raw_svc.get("ptystring") or "DAB"
     desc  = raw_svc.get("mode") or "DAB+ via RTL-SDR"
 
+    # NOTE: ffmpeg has no out-of-band way to pass the Icecast password, so it
+    # necessarily appears in this process's argv (visible in `ps` to local
+    # users). Log output is redacted — see redact().
     ice_url = f"icecast://source:{ICECAST_SOURCE}@{ICECAST_HOST}:{ICECAST_PORT}{mount}"
 
     cmd = [
@@ -872,19 +959,23 @@ def start_stream(raw_svc):
         "sid":    sid,
         "name":   name,
         "mount":  mount,
+        "genre":  genre,
+        "codec":  desc,
         "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}{mount}",
     }
     stderr_thread = threading.Thread(
         target=read_ffmpeg_stderr, args=(proc, mount, name), daemon=True
     )
     stderr_thread.start()
-    stream_procs[mount] = {"ffmpeg": proc, "service": svc_info, "stderr_thread": stderr_thread, "reconnect_count": 0}
+    # Keyed by SID, which is unique within a mux — station labels are not
+    # (e.g. "NRK P1" and "NRK P1+" slugify identically).
+    stream_procs[sid] = {"ffmpeg": proc, "service": svc_info, "stderr_thread": stderr_thread, "reconnect_count": 0}
     logger_daemon.info(f"Stream started: {name} ({sid}) → {mount}")
 
-def stop_stream(mount):
-    entry = stream_procs.pop(mount, None)
-    dls_state.pop(mount, None)
-    prev_error_counters.pop(mount, None)
+def stop_stream(sid):
+    entry = stream_procs.pop(sid, None)
+    dls_state.pop(sid, None)
+    prev_error_counters.pop(sid, None)
     if not entry:
         return
     p = entry.get("ffmpeg")
@@ -894,47 +985,48 @@ def stop_stream(mount):
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
             p.kill()
-    logger_daemon.info(f"Stream stopped: {mount}")
+    logger_daemon.info(f"Stream stopped: {entry['service']['mount']}")
 
 def stop_all_streams():
-    for mount in list(stream_procs.keys()):
-        stop_stream(mount)
+    for sid in list(stream_procs.keys()):
+        stop_stream(sid)
 
 # ─── DLS metadata polling ─────────────────────────────────────────────────────
 
 def metadata_updater():
     """
-    Polls welle-cli /mux.json every 10 s and pushes DLS updates to Icecast.
+    Pushes DLS updates to Icecast every 10 s, from the cached mux.json
+    (refreshed separately by mux_json_fetcher).
     Runs as a daemon thread for the lifetime of the process.
     """
     while True:
         time.sleep(10)
-        if not stream_procs or not welle_proc:
-            continue
-
-        with mux_json_lock:
-            data = latest_mux_json
-        if not data:
-            continue
-
-        svc_by_sid = {s["sid"]: s for s in data.get("services", [])}
-
-        with state_lock:
-            items = list(stream_procs.items())
-
-        for mount, info in items:
-            sid = info["service"]["sid"]
-            raw = svc_by_sid.get(sid)
-            if not raw:
+        try:
+            if not stream_procs:
                 continue
-            dls = raw.get("dls", {}).get("label", "").strip()
-            if dls and dls != dls_state.get(mount):
-                dls_state[mount] = dls
-                update_icecast_metadata(mount, dls)
+
+            with mux_json_lock:
+                data = latest_mux_json
+            if not data:
+                continue
+
+            svc_by_sid = {s.get("sid"): s for s in data.get("services", [])}
+
+            with state_lock:
+                items = list(stream_procs.items())
+
+            for sid, info in items:
+                raw = svc_by_sid.get(sid)
+                if not raw:
+                    continue
+                dls = (raw.get("dls") or {}).get("label", "").strip()
+                if dls and dls != dls_state.get(sid):
+                    dls_state[sid] = dls
+                    update_icecast_metadata(info["service"]["mount"], dls)
+        except Exception:
+            logger_daemon.error(f"metadata_updater iteration failed:\n{traceback.format_exc()}")
 
 # ─── welle-cli watchdog ───────────────────────────────────────────────────────
-
-_welle_restart_in_progress = threading.Event()
 
 def _welle_health_check():
     """
@@ -958,43 +1050,48 @@ def _welle_health_check():
 
 def welle_watchdog():
     """
-    Checks every 15 s if welle-cli is alive and responsive.
-    If the HTTP health-check fails for 3 consecutive attempts (45 s),
-    restarts the full mux (welle-cli + all ffmpeg streams).
+    Every 15 s, makes sure the mux we want tuned is actually tuned and healthy.
+    Recovers from an unresponsive welle-cli (3 failed checks = 45 s) and from a
+    switch whose service discovery came up empty (bad reception, antenna
+    unplugged at boot) by retrying the switch.
     """
     consecutive_failures = 0
     FAILURE_THRESHOLD = 3
 
     while True:
         time.sleep(15)
-        with state_lock:
-            mux_key = current_mux_key
+        try:
+            with state_lock:
+                want    = desired_mux_key
+                current = current_mux_key
+            with switch_lock:
+                busy = switching_to is not None
 
-        if not mux_key:
-            consecutive_failures = 0
-            continue
+            # Nothing wanted (explicit /stop) or a switch is running: stand by.
+            if not want or busy:
+                consecutive_failures = 0
+                continue
 
-        if _welle_restart_in_progress.is_set():
-            # A restart is already underway — don't pile on
-            consecutive_failures = 0
-            continue
+            # Discovery previously failed, or we're not on the wanted mux — retry.
+            if current != want:
+                consecutive_failures = 0
+                logger_daemon.info(f"welle-watchdog: '{want}' not active — retrying switch")
+                switch_mux(want)
+                continue
 
-        if _welle_health_check():
-            consecutive_failures = 0
-            continue
+            if _welle_health_check():
+                consecutive_failures = 0
+                continue
 
-        consecutive_failures += 1
-        logger_daemon.warning(f"welle-watchdog health-check failed ({consecutive_failures}/{FAILURE_THRESHOLD})")
+            consecutive_failures += 1
+            logger_daemon.warning(f"welle-watchdog health-check failed ({consecutive_failures}/{FAILURE_THRESHOLD})")
 
-        if consecutive_failures >= FAILURE_THRESHOLD:
-            consecutive_failures = 0
-            logger_daemon.warning(f"welle-watchdog: welle-cli unresponsive — restarting mux '{mux_key}'")
-            _welle_restart_in_progress.set()
-            try:
-                switch_mux(mux_key)
-            finally:
-                # Clear after a delay so the new welle-cli has time to start
-                threading.Timer(DISCOVERY_TIMEOUT + 10, _welle_restart_in_progress.clear).start()
+            if consecutive_failures >= FAILURE_THRESHOLD:
+                consecutive_failures = 0
+                logger_daemon.warning(f"welle-watchdog: welle-cli unresponsive — restarting mux '{want}'")
+                switch_mux(want)
+        except Exception:
+            logger_daemon.error(f"welle_watchdog iteration failed:\n{traceback.format_exc()}")
 
 # ─── Stream watchdog ─────────────────────────────────────────────────────────
 
@@ -1005,22 +1102,26 @@ def stream_watchdog():
     """
     while True:
         time.sleep(30)
-        if not welle_proc or welle_proc.poll() is not None:
-            continue
-
-        with state_lock:
-            dead = [
-                (mount, info)
-                for mount, info in stream_procs.items()
-                if info["ffmpeg"].poll() is not None
-            ]
-
-        for mount, info in dead:
-            logger_daemon.warning(f"Restarting dead stream: {mount}")
+        try:
+            # Don't fight a switch that is tearing streams down on purpose.
             with state_lock:
-                stream_procs.pop(mount, None)
-                dls_state.pop(mount, None)
-            start_stream_from_info(info["service"])
+                proc = welle_proc
+                busy = switching_to is not None
+                dead = [] if (busy or proc is None or proc.poll() is not None) else [
+                    (sid, info)
+                    for sid, info in stream_procs.items()
+                    if info["ffmpeg"].poll() is not None
+                ]
+
+                # Restart under the same lock so a concurrent switch can't
+                # interleave and leave an orphaned ffmpeg behind.
+                for sid, info in dead:
+                    logger_daemon.warning(f"Restarting dead stream: {info['service']['mount']}")
+                    stream_procs.pop(sid, None)
+                    dls_state.pop(sid, None)
+                    start_stream_from_info(info["service"])
+        except Exception:
+            logger_daemon.error(f"stream_watchdog iteration failed:\n{traceback.format_exc()}")
 
 def start_stream_from_info(svc_info):
     """Restart a stream given the cached service info dict."""
@@ -1029,8 +1130,8 @@ def start_stream_from_info(svc_info):
         "label": {"label": svc_info["name"]},
         "sid":   svc_info["sid"],
         "url_mp3": f"/mp3/{svc_info['sid']}",
-        "ptystring": "",
-        "mode": "DAB+ via RTL-SDR",
+        "ptystring": svc_info.get("genre", ""),
+        "mode": svc_info.get("codec") or "DAB+ via RTL-SDR",
     }
     start_stream(raw_svc)
 
@@ -1040,31 +1141,42 @@ def preventive_restart_scheduler():
     """
     Performs a graceful restart of the current MUX at a configured hour
     (default 03:00) to clear accumulated welle-cli file descriptor leaks.
+    Set PREVENTIVE_RESTART_HOUR outside 0-23 (e.g. -1) to disable.
     """
+    if not 0 <= PREVENTIVE_RESTART_HOUR <= 23:
+        logger_daemon.info(
+            f"Preventive restart disabled (PREVENTIVE_RESTART_HOUR={PREVENTIVE_RESTART_HOUR})"
+        )
+        return
+
     while True:
-        now = time.localtime()
-        next_run = time.mktime((
-            now.tm_year, now.tm_mon, now.tm_mday,
-            PREVENTIVE_RESTART_HOUR, 0, 0,
-            now.tm_wday, now.tm_yday, now.tm_isdst
-        ))
-        if next_run <= time.time():
-            # Schedule for tomorrow
-            next_run += 86400
+        try:
+            now = time.localtime()
+            next_run = time.mktime((
+                now.tm_year, now.tm_mon, now.tm_mday,
+                PREVENTIVE_RESTART_HOUR, 0, 0,
+                now.tm_wday, now.tm_yday, -1   # let libc resolve DST for that date
+            ))
+            if next_run <= time.time():
+                # Schedule for tomorrow
+                next_run += 86400
 
-        sleep_secs = next_run - time.time()
-        logger_daemon.info(f"Preventive restart scheduled in {sleep_secs/3600:.1f} hours (at {PREVENTIVE_RESTART_HOUR}:00)")
-        time.sleep(sleep_secs)
+            sleep_secs = next_run - time.time()
+            logger_daemon.info(f"Preventive restart scheduled in {sleep_secs/3600:.1f} hours (at {PREVENTIVE_RESTART_HOUR}:00)")
+            time.sleep(sleep_secs)
 
-        with state_lock:
-            mux_key = current_mux_key
+            with state_lock:
+                mux_key = desired_mux_key
 
-        if not mux_key:
-            logger_daemon.info("No active MUX — skipping preventive restart")
-            continue
+            if not mux_key:
+                logger_daemon.info("No active MUX — skipping preventive restart")
+                continue
 
-        logger_daemon.info(f"Performing preventive restart of MUX '{mux_key}'")
-        switch_mux(mux_key)
+            logger_daemon.info(f"Performing preventive restart of MUX '{mux_key}'")
+            switch_mux(mux_key)
+        except Exception:
+            logger_daemon.error(f"preventive_restart_scheduler iteration failed:\n{traceback.format_exc()}")
+            time.sleep(60)
 
 # ─── Icecast metadata ─────────────────────────────────────────────────────────
 
@@ -1102,35 +1214,60 @@ def get_mux(key):
             return m
     return None
 
+def stop_everything():
+    """Stop all streams and welle-cli, and stay stopped (watchdog stands down)."""
+    global desired_mux_key, current_mux_key
+    with state_lock:
+        desired_mux_key = None
+        current_mux_key = None
+        stop_all_streams()
+        stop_welle()
+    logger_daemon.info("Stopped on request — watchdog will not restart until /switch")
+
 def switch_mux(mux_key):
-    global switching_to
+    """Retune to a mux. Returns False if the key is unknown or a switch is
+    already running — switches must not overlap (one tuner, shared state)."""
+    global switching_to, desired_mux_key
     mux = get_mux(mux_key)
     if not mux:
         logger_daemon.warning(f"Unknown MUX: {mux_key}")
         return False
 
+    with state_lock:
+        desired_mux_key = mux_key   # what the watchdog should keep tuned
+
     def _do_switch():
-        global current_mux_key, switching_to
+        global current_mux_key
         logger_daemon.info(f"Switching to: {mux['name']}")
 
         with state_lock:
             stop_all_streams()
             start_welle(mux["channel"])
+            # No mux is active until discovery succeeds; keeps the watchdog
+            # and /now from acting on a half-switched state.
+            current_mux_key = None
 
         logger_daemon.info(f"Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
         raw_services = fetch_services_from_welle()
 
         if not raw_services:
-            logger_daemon.warning("ERROR: No services found — check channel and reception")
+            logger_daemon.warning(
+                f"No services found on {mux['name']} — check channel and reception; "
+                "will retry automatically"
+            )
             return
+
+        names = [s["label"]["label"].strip() for s in raw_services]
+        register_slugs(names)
 
         # Build and cache a clean service list
         services = [
             {
                 "sid":    s["sid"],
                 "name":   s["label"]["label"].strip(),
-                "mount":  f"/dab/{slugify(s['label']['label'].strip())}",
-                "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}/dab/{slugify(s['label']['label'].strip())}",
+                "mount":  mount_for(s["label"]["label"].strip(), s["sid"]),
+                "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}"
+                          f"{mount_for(s['label']['label'].strip(), s['sid'])}",
             }
             for s in raw_services
         ]
@@ -1149,10 +1286,19 @@ def switch_mux(mux_key):
         global switching_to
         try:
             _do_switch()
+        except Exception:
+            logger_daemon.error(f"Switch to {mux_key} failed:\n{traceback.format_exc()}")
         finally:
-            switching_to = None
+            with switch_lock:
+                switching_to = None
 
-    switching_to = mux_key  # set before returning so /now reflects it immediately
+    with switch_lock:
+        if switching_to is not None:
+            logger_daemon.info(f"Switch to {mux_key} ignored — switch to {switching_to} in progress")
+            return False
+        # Set before returning so /now reflects it immediately
+        switching_to = mux_key
+
     threading.Thread(target=_run_switch, daemon=True).start()
     return True
 
@@ -1167,12 +1313,13 @@ def build_now_payload():
         mux_key     = current_mux_key
         welle_alive = welle_proc is not None and welle_proc.poll() is None
         streams = {
-            info["service"]["sid"]: {
-                "mount": mount,
+            sid: {
+                "mount": info["service"]["mount"],
                 "alive": info["ffmpeg"].poll() is None,
             }
-            for mount, info in stream_procs.items()
+            for sid, info in stream_procs.items()
         }
+        snapshots = {k: v for k, v in station_snapshots.items()}
 
     stations = []
     if data and welle_alive:
@@ -1198,7 +1345,7 @@ def build_now_payload():
             stations.append({
                 "sid":        sid,
                 "name":       name,
-                "mount":      entry["mount"] if entry else f"{ICECAST_MOUNT_BASE}/{slugify(name)}",
+                "mount":      entry["mount"] if entry else mount_for(name, sid),
                 "streaming":  bool(entry and entry["alive"]),
                 "genre":      svc.get("ptystring") or "",
                 "codec":      svc.get("mode") or "",
@@ -1207,8 +1354,8 @@ def build_now_payload():
                 "dls":        (svc.get("dls") or {}).get("label", "").strip(),
                 "slide_ts":   mot.get("lastchange") or 0,
                 "audio_db": {
-                    "left":  round(linear_to_db(audio.get("left", 0)), 1),
-                    "right": round(linear_to_db(audio.get("right", 0)), 1),
+                    "left":  round(linear_to_db(audio.get("left") or 0), 1),
+                    "right": round(linear_to_db(audio.get("right") or 0), 1),
                 },
                 "errors": {
                     "frame": errs.get("frameerrors", 0),
@@ -1223,7 +1370,9 @@ def build_now_payload():
     # previous line-up instantly during a switch. Don't record mid-switch:
     # mux.json may already belong to the new mux while current_mux_key is old.
     if mux_key and stations and switching_to is None:
-        station_snapshots[mux_key] = stations
+        with state_lock:
+            station_snapshots[mux_key] = stations
+            snapshots = {k: v for k, v in station_snapshots.items()}
 
     data     = data or {}
     demod    = data.get("demodulator") or {}
@@ -1235,7 +1384,7 @@ def build_now_payload():
     return {
         "current_mux": mux_key,
         "switching_to": switching_to,
-        "snapshots":   station_snapshots,
+        "snapshots":   snapshots,
         "welle_alive": welle_alive,
         "ensemble":    ens_label.strip(),
         "signal": {
@@ -1259,6 +1408,10 @@ def json_response(handler, code, data):
     handler.wfile.write(body)
 
 class DABHandler(BaseHTTPRequestHandler):
+
+    # Don't let a client that opens a socket and never sends a request pin a
+    # thread forever (BaseHTTPRequestHandler defaults to no timeout).
+    timeout = 30
 
     QUIET_PATHS = ("/now", "/muxes", "/slide/", "/status", "/health", "/config", "/favicon")
 
@@ -1307,8 +1460,13 @@ class DABHandler(BaseHTTPRequestHandler):
                 body  = resp.read()
                 ctype = resp.headers.get("Content-Type", "image/jpeg")
                 resp.close()
+                # Slides come from broadcast content — never let the upstream
+                # type turn this into same-origin HTML/JS.
+                if ctype not in ("image/jpeg", "image/png", "image/gif"):
+                    ctype = "image/jpeg"
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Content-Length", len(body))
                 # UI cache-busts with ?t=<mot lastchange>, so cache aggressively
                 self.send_header("Cache-Control", "max-age=86400")
@@ -1327,16 +1485,14 @@ class DABHandler(BaseHTTPRequestHandler):
                 json_response(self, 404, {"error": "bad sid"})
                 return
 
-            deadline = time.time() + 90
+            deadline = time.time() + LISTEN_WAIT_TIMEOUT
             upstream = None
             while time.time() < deadline and upstream is None:
                 mount = None
                 with state_lock:
-                    if switching_to is None:
-                        for m, info in stream_procs.items():
-                            if info["service"]["sid"] == sid and info["ffmpeg"].poll() is None:
-                                mount = m
-                                break
+                    entry = stream_procs.get(sid)
+                    if switching_to is None and entry and entry["ffmpeg"].poll() is None:
+                        mount = entry["service"]["mount"]
                 if mount:
                     try:
                         upstream = urllib.request.urlopen(
@@ -1352,6 +1508,12 @@ class DABHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                # Icecast trickles audio in real time; a read timeout here would
+                # abort every listener on a brief source hiccup.
+                try:
+                    upstream.fp.raw._sock.settimeout(None)
+                except Exception:
+                    pass
                 self.send_response(200)
                 self.send_header("Content-Type", upstream.headers.get("Content-Type", "audio/mpeg"))
                 self.send_header("Cache-Control", "no-store")
@@ -1361,8 +1523,8 @@ class DABHandler(BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # listener went away
+            except Exception:
+                pass  # listener went away, or the source ended
             finally:
                 try:
                     upstream.close()
@@ -1380,17 +1542,19 @@ class DABHandler(BaseHTTPRequestHandler):
             with state_lock:
                 active = [
                     {
-                        "mount":        mount,
+                        "mount":        info["service"]["mount"],
                         "name":         info["service"]["name"],
                         "sid":          info["service"]["sid"],
                         "stream":       info["service"]["stream"],
                         "ffmpeg_alive": info["ffmpeg"].poll() is None,
                     }
-                    for mount, info in stream_procs.items()
+                    for info in stream_procs.values()
                 ]
+                cur = current_mux_key
+                alive = welle_proc is not None and welle_proc.poll() is None
             json_response(self, 200, {
-                "current_mux":    current_mux_key,
-                "welle_alive":    welle_proc is not None and welle_proc.poll() is None,
+                "current_mux":    cur,
+                "welle_alive":    alive,
                 "active_streams": active,
             })
 
@@ -1399,10 +1563,10 @@ class DABHandler(BaseHTTPRequestHandler):
                 welle_alive = welle_proc is not None and welle_proc.poll() is None
                 streams = []
                 overall = "OK"
-                for mount, info in stream_procs.items():
+                for info in stream_procs.values():
                     alive = info["ffmpeg"].poll() is None
                     streams.append({
-                        "mount":           mount,
+                        "mount":           info["service"]["mount"],
                         "name":            info["service"]["name"],
                         "ffmpeg_alive":    alive,
                         "reconnect_count": info.get("reconnect_count", 0),
@@ -1462,8 +1626,12 @@ class DABHandler(BaseHTTPRequestHandler):
             mux_key = parsed.path[len("/switch/"):]
             if switch_mux(mux_key):
                 json_response(self, 202, {"ok": True, "switching_to": mux_key})
-            else:
+            elif not get_mux(mux_key):
                 json_response(self, 404, {"error": f"unknown mux: {mux_key}"})
+            else:
+                # Valid mux, but a switch is already running — one tuner.
+                json_response(self, 409, {"error": "switch already in progress",
+                                          "switching_to": switching_to})
 
         else:
             json_response(self, 404, {"error": "not found"})
@@ -1479,13 +1647,15 @@ class DABHandler(BaseHTTPRequestHandler):
                 return
             if switch_mux(mux_key):
                 json_response(self, 202, {"ok": True, "switching_to": mux_key})
-            else:
+            elif not get_mux(mux_key):
                 json_response(self, 404, {"error": f"unknown mux: {mux_key}"})
+            else:
+                # Valid mux, but a switch is already running — one tuner.
+                json_response(self, 409, {"error": "switch already in progress",
+                                          "switching_to": switching_to})
 
         elif parsed.path == "/stop":
-            with state_lock:
-                stop_all_streams()
-                stop_welle()
+            stop_everything()
             json_response(self, 200, {"ok": True, "status": "stopped"})
 
         else:

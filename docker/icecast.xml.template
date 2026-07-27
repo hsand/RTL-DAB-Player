@@ -17,7 +17,9 @@
         <admin-password>${ICECAST_ADMIN_PASS}</admin-password>
     </authentication>
 
-    <hostname>localhost</hostname>
+    <!-- Advertised in stream URLs on the status page; set ICECAST_HOSTNAME
+         to this machine's LAN name/IP so those links work for listeners. -->
+    <hostname>${ICECAST_HOSTNAME}</hostname>
 
     <paths>
         <basedir>/usr/share/icecast2</basedir>
@@ -28,7 +30,7 @@
     </paths>
 
     <listen-socket>
-        <port>8000</port>
+        <port>${ICECAST_PORT}</port>
         <bind-address>0.0.0.0</bind-address>
     </listen-socket>
 

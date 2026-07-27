@@ -77,7 +77,8 @@ The web UI is a client of this API — everything it shows is available as JSON 
 |--------|------|-------------|
 | GET | `/` | Web player UI |
 | GET | `/now` | Live state: stations with now-playing, slide timestamps, audio levels, error counters; SNR and receiver info; per-mux snapshots |
-| GET | `/listen/<sid>` | Audio stream for a station; if a mux switch is running, waits until the stream is live, then pipes audio |
+| GET | `/listen/<sid>` | Audio stream for a station; if a mux switch is running, holds the connection until the stream is live (up to `LISTEN_WAIT_TIMEOUT`, default 90 s, then 404) |
+| GET | `/config` | Icecast mode/host/port the UI should use |
 | GET | `/slide/<sid>` | Current MOT slideshow image for a station (404 if none yet) |
 | GET | `/status` | Current mux, welle-cli state, active stream URLs |
 | GET | `/health` | Health summary for monitoring (welle-cli, streams, SNR) |
@@ -91,20 +92,40 @@ The web UI is a client of this API — everything it shows is available as JSON 
 Needs Linux with Python 3, `ffmpeg`, Icecast2, and [welle-cli built from source](https://github.com/AlbrechtL/welle.io):
 
 ```bash
-sudo apt install cmake librtlsdr-dev libfftw3-dev libfaad-dev libmpg123-dev libmp3lame-dev ffmpeg icecast2
-git clone https://github.com/AlbrechtL/welle.io
-cd welle.io && mkdir build && cd build
-cmake -DBUILD_WELLE_CLI=ON -DBUILD_GUI_APP=OFF ..
-make -j$(nproc) && sudo cp src/welle-cli/welle-cli /usr/local/bin/
+sudo apt install git build-essential cmake pkg-config xxd \
+    librtlsdr-dev libfftw3-dev libfaad-dev libmpg123-dev libmp3lame-dev \
+    libusb-1.0-0-dev ffmpeg icecast2 python3
+git clone --depth 1 https://github.com/AlbrechtL/welle.io
+cmake -S welle.io -B welle.io/build \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_WELLE_IO=OFF -DBUILD_WELLE_CLI=ON -DRTLSDR=ON
+cmake --build welle.io/build --target welle-cli -j$(nproc)
+sudo install -m 755 welle.io/build/welle-cli /usr/local/bin/
 ```
 
-Configure the constants at the top of [daemon/dab-daemon.py](daemon/dab-daemon.py) (Icecast host/passwords, ports, `MUX_LIST`) or set the corresponding environment variables, then install it as a service:
+> `-DBUILD_WELLE_IO=OFF` skips the Qt GUI (which you don't need and would pull in Qt);
+> `-DRTLSDR=ON` is required or the resulting binary can't talk to the dongle.
+
+Install the daemon and its service unit:
 
 ```bash
 sudo cp daemon/dab-daemon.py /usr/local/bin/dab-daemon.py
 sudo chmod +x /usr/local/bin/dab-daemon.py
 sudo mkdir -p /var/lib/dab-daemon
 sudo cp daemon/dab-daemon.service /etc/systemd/system/
+```
+
+Configure it via `/etc/default/dab-daemon`, which the unit reads (same variable names as [docker/.env.example](docker/.env.example)):
+
+```bash
+ICECAST_HOST=localhost
+ICECAST_SOURCE=your-source-password
+ICECAST_ADMIN_PASS=your-admin-password
+MUX_LIST=[{"key":"mux1","name":"My MUX (12D)","channel":"12D"}]
+```
+
+Then start it:
+
+```bash
 sudo systemctl daemon-reload && sudo systemctl enable --now dab-daemon
 ```
 

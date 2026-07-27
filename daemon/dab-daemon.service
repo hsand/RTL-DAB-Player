@@ -1,14 +1,28 @@
 [Unit]
 Description=RTL DAB Player daemon
 After=network.target
+Wants=network-online.target
 
 [Service]
+# Configuration lives here — same variable names as docker/.env.example.
+# The leading '-' makes the file optional.
+EnvironmentFile=-/etc/default/dab-daemon
 ExecStart=/usr/bin/python3 /usr/local/bin/dab-daemon.py
 Restart=on-failure
 RestartSec=5
 User=root
 StandardOutput=journal
 StandardError=journal
+
+# Hardening — the daemon needs USB (the dongle) and the network, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/dab-daemon /var/log/dabservice
 
 [Install]
 WantedBy=multi-user.target

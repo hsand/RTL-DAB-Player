@@ -26,13 +26,32 @@ services:
       ICECAST_ADMIN_PASS: ${ICECAST_ADMIN_PASS:-changeme_admin}
       ICECAST_PORT:       ${ICECAST_PORT:-8000}
       ICECAST_MOUNT:      ${ICECAST_MOUNT:-/dab}
+      # Set to this machine's LAN IP/name so the stream links on Icecast's
+      # status page work for listeners (internal mode only).
+      ICECAST_HOSTNAME:   ${ICECAST_HOSTNAME:-localhost}
       # ── Daemon ──────────────────────────────────────────────────────────────
       DAEMON_PORT:        ${DAEMON_PORT:-9980}
+      DISCOVERY_TIMEOUT:  ${DISCOVERY_TIMEOUT:-30}
+      LISTEN_WAIT_TIMEOUT: ${LISTEN_WAIT_TIMEOUT:-90}
       # ── MUX list ────────────────────────────────────────────────────────────
       # Set MUX_LIST in docker/.env (see .env.example) to the ensembles
       # receivable in your area, e.g.:
       #   MUX_LIST=[{"key":"mux1","name":"My MUX (10B)","channel":"10B"}]
       MUX_LIST:           ${MUX_LIST:-}
+      # ── Logging ─────────────────────────────────────────────────────────────
+      LOG_DIR:            ${LOG_DIR:-/var/log/dabservice}
+      LOG_MAX_BYTES:      ${LOG_MAX_BYTES:-10485760}
+      LOG_BACKUP_COUNT:   ${LOG_BACKUP_COUNT:-3}
+      # ── Monitoring / maintenance ────────────────────────────────────────────
+      SNR_WARNING_THRESHOLD:   ${SNR_WARNING_THRESHOLD:-10}
+      PREVENTIVE_RESTART_HOUR: ${PREVENTIVE_RESTART_HOUR:-3}
     volumes:
       - ./logs:/var/log/dabservice  # Map container logs to host directory
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${DAEMON_PORT:-9980}/health', timeout=5).status==200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
     restart: unless-stopped
