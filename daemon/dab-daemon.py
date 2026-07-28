@@ -192,6 +192,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     display: grid; gap: 0.9rem;
     grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
   }
+  .grid > * { min-width: 0; }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
     overflow: hidden; cursor: pointer; transition: transform 0.12s, border-color 0.12s;
@@ -209,7 +210,11 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
   .meta {
     padding: 0.65rem 0.7rem 0.75rem;
     display: flex; flex-direction: column; gap: 0.32rem;
+    min-width: 0;   /* flex items default to min-width:auto */
   }
+  /* Without this, a nowrap line refuses to shrink below its text width and
+     stretches the card — Safari honours that, Chrome happens to absorb it. */
+  .meta > * { min-width: 0; max-width: 100%; }
   .name { font-weight: 650; font-size: 0.95rem; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* Always reserve the row, even when a station reports no genre, so the
      codec line and song title sit at the same height on every card. */
@@ -251,11 +256,14 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
   .card.playing .marquee > span,
   .card:hover .marquee > span {
     will-change: transform;
+    -webkit-animation: var(--anim) var(--dur) linear infinite;
     animation: var(--anim) var(--dur) linear infinite;
+    -webkit-animation-delay: calc(0.35s - var(--hold, 1.6s));
     animation-delay: calc(0.35s - var(--hold, 1.6s));
   }
   #bar-dls.marquee > span {
     will-change: transform;
+    -webkit-animation: var(--anim) var(--dur) linear infinite;
     animation: var(--anim) var(--dur) linear infinite;
   }
   @media (prefers-reduced-motion: reduce) {
@@ -652,6 +660,9 @@ function marqueeAnimation(travel, dur) {
     try {
       const sheet = document.styleSheets[0];
       sheet.insertRule(css, sheet.cssRules.length);
+      // Older WebKit only matches -webkit-animation against -webkit-keyframes
+      try { sheet.insertRule(css.replace('@keyframes', '@-webkit-keyframes'), sheet.cssRules.length); }
+      catch (e2) { /* modern browsers reject this; harmless */ }
     } catch (e) {
       return '';   // no marquee rather than a broken animation
     }
